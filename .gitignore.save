@@ -1,7 +1,0 @@
-git rm -r --cached -f .
-git add .gitignore
-git add .
-git status
-E
-
-
