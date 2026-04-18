@@ -23,6 +23,13 @@
 //  - Учитываем "Deposit Void" как денежную операцию (это отмена депозита).
 //    Для логики схлопывания нормализуем "Deposit Void" -> Withdraw,
 //    но в выводе оставляем оригинальный title "Deposit Void".
+//
+// ✅ FIX 2026-04-18:
+//  - Для Evotor исключаем пары ПРОДАЖА/ВОЗВРАТ, если:
+//      1) строка возврата определяется по evotor_type (PAYBACK/REFUND/RETURN),
+//      2) у второй строки тот же position_uuid,
+//      3) суммы одинаковые.
+//    Тогда обе строки не учитываются и не выводятся в отчёте.
 
 import '../env.js';
 
@@ -126,6 +133,20 @@ function classifyEvotorPaymentType(payType) {
 
 function nearlyEqual(a, b, eps = 0.01) {
   return Math.abs(a - b) <= eps;
+}
+
+function isEvotorReturnType(evotorType) {
+  const t = String(evotorType || '').toUpperCase().trim();
+  return (
+    t === 'PAYBACK' ||
+    t.includes('PAYBACK') ||
+    t.includes('REFUND') ||
+    t.includes('RETURN')
+  );
+}
+
+function moneyAbsKey(value) {
+  return Math.round(Math.abs(Number(value || 0)) * 100).toString();
 }
 
 // ======================= OUTPUT SETUP =========================
@@ -672,9 +693,16 @@ out('');
 const evotorPayments = [];
 
 if (evotorSessionNumber != null) {
-  const evRows = await q(
+  const evRowsRaw = await q(
     `
-      SELECT id, close_date, result_sum, payments_type, session_number
+      SELECT
+        id,
+        close_date,
+        result_sum,
+        payments_type,
+        session_number,
+        position_uuid,
+        evotor_type
       FROM evotor_sales
       WHERE session_number = ?
         AND device_id = ?
@@ -684,8 +712,66 @@ if (evotorSessionNumber != null) {
     [evotorSessionNumber, DEVICE_ID],
   );
 
+  // --- 5.1. Исключаем пары продажа/возврат Evotor по position_uuid + одинаковой сумме ---
+  const saleBuckets = new Map();
+
+  evRowsRaw.forEach((r, idx) => {
+    if (isEvotorReturnType(r.evotor_type)) return;
+
+    const positionUuid = String(r.position_uuid || '').trim();
+    if (!positionUuid) return;
+
+    const key = `${positionUuid}|${moneyAbsKey(r.result_sum)}`;
+
+    let arr = saleBuckets.get(key);
+    if (!arr) {
+      arr = [];
+      saleBuckets.set(key, arr);
+    }
+    arr.push(idx);
+  });
+
+  const evotorDropIdx = new Set();
+  let evotorCanceledPairs = 0;
+
+  for (let idx = 0; idx < evRowsRaw.length; idx++) {
+    const r = evRowsRaw[idx];
+    if (!isEvotorReturnType(r.evotor_type)) continue;
+
+    const positionUuid = String(r.position_uuid || '').trim();
+    if (!positionUuid) continue;
+
+    const key = `${positionUuid}|${moneyAbsKey(r.result_sum)}`;
+    const bucket = saleBuckets.get(key);
+    if (!bucket || !bucket.length) continue;
+
+    let saleIdx = -1;
+
+    while (bucket.length) {
+      const candidateIdx = bucket.shift();
+      if (candidateIdx == null) continue;
+      if (evotorDropIdx.has(candidateIdx)) continue;
+      saleIdx = candidateIdx;
+      break;
+    }
+
+    if (saleIdx < 0) continue;
+
+    evotorDropIdx.add(idx);
+    evotorDropIdx.add(saleIdx);
+    evotorCanceledPairs++;
+  }
+
+  const evRows = evRowsRaw.filter((_, idx) => !evotorDropIdx.has(idx));
+
   out(`Evotor filter: session_number=${evotorSessionNumber}, device_id=${DEVICE_ID}`);
-  out(`Всего операций Evotor категории "SERVICE" (без учета "Своя еда"): ${evRows.length}`);
+  out(`Всего операций Evotor категории "SERVICE" (без учета "Своя еда"): ${evRowsRaw.length}`);
+  if (evotorCanceledPairs > 0) {
+    out(
+      `Исключено пар продажа/возврат Evotor по position_uuid + сумме: ${evotorCanceledPairs}`,
+    );
+  }
+  out(`Осталось операций Evotor для сверки: ${evRows.length}`);
 
   for (const r of evRows) {
     const dt = parseEvotorDate(r.close_date);
@@ -701,6 +787,8 @@ if (evotorSessionNumber != null) {
       payType,
       payments_type: r.payments_type,
       session_number: r.session_number,
+      position_uuid: r.position_uuid || null,
+      evotor_type: r.evotor_type || null,
     });
   }
 

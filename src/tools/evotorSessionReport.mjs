@@ -11,6 +11,12 @@ import { renderTableToPngWrap } from './tableRenderWrap.mjs';
 
 const TZ = process.env.TZ || 'Europe/Moscow';
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const DEVICE_ID = String(process.env.DEVICE_ID || '').trim();
+
+if (!DEVICE_ID) {
+  console.error('Ошибка: в .env не задан DEVICE_ID');
+  process.exit(1);
+}
 
 function envNum(name) {
   const raw = process.env[name];
@@ -89,7 +95,6 @@ function shiftTypeFromDate(dtStr) {
   const d = parseDateFlexible(dtStr);
   if (!d) return 'Дневная';
   const h = d.getHours();
-  // твоя логика: дневной диапазон 4..16 => ночная (как в проекте)
   return h >= 4 && h < 16 ? 'Ночная' : 'Дневная';
 }
 
@@ -186,29 +191,38 @@ function runGsCashUpdate({ monthSheet, year, day, shift, cashRevenue }) {
 // ================= SESSION HELPERS ======================
 
 async function findOpenSession() {
-  const rows = await q(`
+  const rows = await q(
+    `
     SELECT s.session_id, s.session_number, s.close_date
     FROM evotor_sessions s
     WHERE s.evotor_type='OPEN_SESSION'
+      AND s.device_id = ?
       AND NOT EXISTS (
         SELECT 1 FROM evotor_sessions c
-        WHERE c.session_id=s.session_id
+        WHERE c.session_id = s.session_id
+          AND c.device_id = s.device_id
           AND c.evotor_type='CLOSE_SESSION'
       )
     ORDER BY s.close_date DESC
     LIMIT 1
-  `);
+  `,
+    [DEVICE_ID],
+  );
   return rows[0] || null;
 }
 
 async function findLastClosedSession() {
-  const rows = await q(`
+  const rows = await q(
+    `
     SELECT session_id, session_number, close_date
     FROM evotor_sessions
     WHERE evotor_type='CLOSE_SESSION'
+      AND device_id = ?
     ORDER BY close_date DESC
     LIMIT 1
-  `);
+  `,
+    [DEVICE_ID],
+  );
   return rows[0] || null;
 }
 
@@ -218,11 +232,12 @@ async function findBySessionNumber(sessionNumber) {
     SELECT session_id, session_number, close_date
     FROM evotor_sessions
     WHERE evotor_type='CLOSE_SESSION'
-      AND session_number=?
+      AND session_number = ?
+      AND device_id = ?
     ORDER BY close_date DESC
     LIMIT 1
   `,
-    [sessionNumber],
+    [sessionNumber, DEVICE_ID],
   );
   if (closed.length) return closed[0];
 
@@ -231,11 +246,12 @@ async function findBySessionNumber(sessionNumber) {
     SELECT session_id, session_number, close_date
     FROM evotor_sessions
     WHERE evotor_type='OPEN_SESSION'
-      AND session_number=?
+      AND session_number = ?
+      AND device_id = ?
     ORDER BY close_date DESC
     LIMIT 1
   `,
-    [sessionNumber],
+    [sessionNumber, DEVICE_ID],
   );
   return open[0] || null;
 }
@@ -246,11 +262,12 @@ async function findBySessionId(sessionId) {
     SELECT session_id, session_number, close_date
     FROM evotor_sessions
     WHERE evotor_type='CLOSE_SESSION'
-      AND session_id=?
+      AND session_id = ?
+      AND device_id = ?
     ORDER BY close_date DESC
     LIMIT 1
   `,
-    [sessionId],
+    [sessionId, DEVICE_ID],
   );
   if (closed.length) return closed[0];
 
@@ -259,11 +276,12 @@ async function findBySessionId(sessionId) {
     SELECT session_id, session_number, close_date
     FROM evotor_sessions
     WHERE evotor_type='OPEN_SESSION'
-      AND session_id=?
+      AND session_id = ?
+      AND device_id = ?
     ORDER BY close_date DESC
     LIMIT 1
   `,
-    [sessionId],
+    [sessionId, DEVICE_ID],
   );
   return open[0] || null;
 }
@@ -292,9 +310,10 @@ async function loadSessionTimes(sessionId) {
     `
     SELECT evotor_type, close_date
     FROM evotor_sessions
-    WHERE session_id=?
+    WHERE session_id = ?
+      AND device_id = ?
   `,
-    [sessionId],
+    [sessionId, DEVICE_ID],
   );
 
   let opened_at = null;
@@ -351,7 +370,7 @@ async function loadGizmoShiftNearEvotorClose(evotorClose) {
   const base = parseDateFlexible(evotorClose);
   if (!base) return null;
 
-  const deltaMs = 30 * 60 * 1000; // 30 минут
+  const deltaMs = 30 * 60 * 1000;
   const from = new Date(base.getTime() - deltaMs);
   const to = new Date(base.getTime() + deltaMs);
 
@@ -383,7 +402,7 @@ async function loadGizmoShiftNearEvotorClose(evotorClose) {
 
 // ========= BAR STATS (Еда/Напитки/Энергетики/Снэки) =============
 
-async function loadBarStats(sessionNumber) {
+async function loadBarStats(sessionNumber, deviceId) {
   const rows = await q(
     `
     SELECT 
@@ -396,9 +415,10 @@ async function loadBarStats(sessionNumber) {
     LEFT JOIN evotor_product_groups g
            ON p.parent_id = g.group_id
     WHERE es.session_number = ?
+      AND es.device_id = ?
       AND g.name IN ('Еда','Напитки','Энергетики','Снэки')
   `,
-    [sessionNumber],
+    [sessionNumber, deviceId],
   );
 
   return rows[0] || { total: 0, cash: 0, electron: 0 };
@@ -502,7 +522,6 @@ function dbgPrintBlock(title, rows, maxRows = 80) {
 function isCashOrCreditCardMethod(methodName) {
   const ml = String(methodName || '').toLowerCase();
   if (ml === 'cash') return true;
-  // покрываем 'credit card' и возможные вариации с пробелами/регистром
   if (ml.includes('credit') && ml.includes('card')) return true;
   return false;
 }
@@ -514,7 +533,6 @@ function normalizeBonusStatusDbToLabel(statusRaw) {
   if (s === 'promo') return 'акция';
   if (s === 'boss') return 'босс';
   if (s === 'admin') return 'админ';
-  // ⚠️ "нет" если status=open или записи не нашли
   return 'нет';
 }
 
@@ -523,8 +541,6 @@ function normalizeName(s) {
 }
 
 function findBestBonusTaskMatch(bonus, tasks) {
-  // bonus: { time: Date, customer: string, amount: number }
-  // tasks: [{trx_time: Date, client_name: string, amount: number, status: string}]
   if (!bonus?.time || !tasks?.length) return null;
 
   const bName = normalizeName(bonus.customer);
@@ -533,7 +549,6 @@ function findBestBonusTaskMatch(bonus, tasks) {
   let best = null;
   let bestDt = Infinity;
 
-  // окно матчинга (на всякий) — 30 минут
   const WIN_MS = 30 * 60 * 1000;
 
   for (const t of tasks) {
@@ -543,7 +558,6 @@ function findBestBonusTaskMatch(bonus, tasks) {
     if (!nearlyEqual(tAmt, bAmt)) continue;
 
     const tName = normalizeName(t.client_name);
-    // строгое совпадение по имени, но с мягким fallback (contains)
     const nameOk =
       (bName && tName && (bName === tName || bName.includes(tName) || tName.includes(bName))) ||
       (!bName && !tName);
@@ -638,7 +652,6 @@ async function calcGizmoTotalsForShift(shiftId) {
       ? gizmoResp.result.transactions
       : [];
 
-    // 0) СЫРЫЕ ТРАНЗАКЦИИ (до фильтра)
     dbgPrintBlock(
       'GIZMO RAW transactions (before any filter)',
       gizmoTransactions.map(dbgRowFromGizmoTx),
@@ -647,7 +660,6 @@ async function calcGizmoTotalsForShift(shiftId) {
 
     let gizmoPayments = [];
 
-    // фильтр денежных операций (как в gizmoTransactionsShiftReport) + Deposit/Withdraw схлопывание
     for (const t of gizmoTransactions) {
       const rawTitle = t.title || '';
       const title = rawTitle.trim();
@@ -657,8 +669,6 @@ async function calcGizmoTotalsForShift(shiftId) {
       const method = t.paymentMethodName || '';
       const ml = String(method).toLowerCase();
 
-      // ✅ исключаем "Deposit" метод (paymentMethodName contains 'deposit') кроме бонусов
-      // (это именно метод оплаты, а не title=Deposit)
       if (ml.includes('deposit') && !ml.includes('бонус')) continue;
 
       const okOp = op === '' || operators.has(op);
@@ -668,13 +678,10 @@ async function calcGizmoTotalsForShift(shiftId) {
 
       if (tl === 'void') continue;
 
-      // ---- НОРМАЛИЗАЦИЯ Deposit Void -> Withdraw (только Cash/Credit Card) ----
       const isDepositVoid = tl === 'deposit void' || (tl.startsWith('deposit') && tl.includes('void'));
       let titleNorm = title;
       if (isDepositVoid) {
-        // ✅ учитываем ТОЛЬКО если метод реальный: Cash / Credit Card
         if (!isCashOrCreditCardMethod(method)) {
-          // не считаем внутренние void-операции по deposit-методу и т.п.
           continue;
         }
         titleNorm = 'Withdraw';
@@ -682,10 +689,8 @@ async function calcGizmoTotalsForShift(shiftId) {
 
       let isMoney = false;
 
-      // ✅ Withdraw добавлен
       if (tl === 'payment' || tl === 'deposit' || tl === 'withdraw') isMoney = true;
 
-      // ✅ Deposit Void (нормализованный в Withdraw) считаем денежной операцией
       if (titleNorm === 'Withdraw') isMoney = true;
 
       if (tl.includes('refund') || tl.includes('return') || tl.includes('возврат')) isMoney = true;
@@ -702,27 +707,23 @@ async function calcGizmoTotalsForShift(shiftId) {
 
       let payType = classifyGizmoMethod(method);
 
-      // Deposit/Withdraw: уточняем тип оплаты по методу
       if (titleNorm === 'Deposit' || titleNorm === 'Withdraw') {
         if (ml.includes('cash')) payType = 'cash';
         else if (ml.includes('card')) payType = 'noncash';
-        // для safety: если не удалось, оставляем как есть
       }
 
-      // Важно: в расчёте используем titleNorm (для схлопывания Deposit/Withdraw)
       gizmoPayments.push({
         id: t.invoiceId || null,
         time: dt,
         amount,
         payType,
         method,
-        title: title,        // исходный
-        titleNorm: titleNorm, // нормализованный
+        title: title,
+        titleNorm: titleNorm,
         customer: t.customerName || '',
       });
     }
 
-    // 1) ПОСЛЕ ПЕРВИЧНЫХ ФИЛЬТРОВ
     dbgPrintBlock(
       'GIZMO payments AFTER primary filters (operator/auto/void/deposit-method/isMoney)',
       gizmoPayments.map(dbgRowFromPayment),
@@ -731,7 +732,6 @@ async function calcGizmoTotalsForShift(shiftId) {
 
     const beforeCount = gizmoPayments.length;
 
-    // 1) взаимное уничтожение Payment/Refund по invoiceId
     const totalsByInvoice = new Map();
     for (const g of gizmoPayments) {
       if (!g.id) continue;
@@ -749,8 +749,7 @@ async function calcGizmoTotalsForShift(shiftId) {
 
     gizmoPayments = gizmoPayments.filter(g => !(g.id && cancelledInvoices.has(g.id)));
 
-    // 2) парное уничтожение бонусов по пользователю и сумме
-    const bonusByCustomer = new Map(); // customer -> [{ g, idx }, ...]
+    const bonusByCustomer = new Map();
     gizmoPayments.forEach((g, idx) => {
       if (g.payType !== 'bonus') return;
       const key = g.customer || '(no name)';
@@ -804,14 +803,12 @@ async function calcGizmoTotalsForShift(shiftId) {
       gizmoPayments = gizmoPayments.filter((_, idx) => !bonusToRemove.has(idx));
     }
 
-    // 3) ✅ парное уничтожение Deposit(+X) ↔ Withdraw(-X) (НЕ бонус) по клиенту/методу/типу оплаты
-    const DEP_WD_WINDOW_MS = 30 * 60 * 1000; // 30 минут
+    const DEP_WD_WINDOW_MS = 30 * 60 * 1000;
 
     const depWdByKey = new Map();
     gizmoPayments.forEach((g, idx) => {
       if (g.payType === 'bonus') return;
 
-      // используем нормализованный title
       const tnorm = String(g.titleNorm || g.title || '').toLowerCase();
       if (tnorm !== 'deposit' && tnorm !== 'withdraw') return;
 
@@ -865,7 +862,6 @@ async function calcGizmoTotalsForShift(shiftId) {
       gizmoPayments = gizmoPayments.filter((_, idx) => !depWdToRemove.has(idx));
     }
 
-    // 2) ПОСЛЕ ВСЕХ УНИЧТОЖЕНИЙ
     dbgPrintBlock(
       'GIZMO payments AFTER cancellations (invoice/bonus/deposit-withdraw)',
       gizmoPayments.map(dbgRowFromPayment),
@@ -877,7 +873,6 @@ async function calcGizmoTotalsForShift(shiftId) {
       afterAllCancels: gizmoPayments.length,
     });
 
-    // итоговые суммы по GIZMO: cash/noncash (как и раньше, бонусы НЕ входят)
     let gizmoCash = 0;
     let gizmoNonCash = 0;
 
@@ -886,7 +881,6 @@ async function calcGizmoTotalsForShift(shiftId) {
       else if (g.payType === 'noncash') gizmoNonCash += g.amount;
     }
 
-    // бонусные операции (после взаимного уничтожения) – для отчёта
     const bonuses = [];
     let bonusesTotal = 0;
 
@@ -955,6 +949,8 @@ async function sendPhoto({ chatId, filePath, caption }) {
 
 async function main() {
   try {
+    console.log(`DEVICE_ID: ${DEVICE_ID}`);
+
     const session = await resolveSession();
 
     if (!session) {
@@ -972,19 +968,14 @@ async function main() {
       return;
     }
 
-    // === суммы ЭВОТОР ===
     const zTotal = Number(zReport.z_total ?? 0);
     const zCash = Number(zReport.z_cash ?? 0);
     const zElectron = Number(zReport.z_electron ?? 0);
 
-    // === суммы ВОЗВРАТОВ ===
     const refundTotal = Number(zReport.z_refund_total ?? 0);
     const refundCash = Number(zReport.z_refund_cash ?? 0);
     const refundElectron = Number(zReport.z_refund_electron ?? 0);
 
-    // ====== GS: обновляем "Выручка налички" по OPEN_SESSION (карточка привязана к открытию) ======
-    // В таблицу пишем diffCash = z_cash - z_refund_cash
-    // shift для таблицы: day=04..15, night=16..03
     if (GS_CASHUPDATE_ENABLED) {
       try {
         const opened = parseDateFlexible(times.opened_at);
@@ -1017,10 +1008,8 @@ async function main() {
       }
     }
 
-    // === Бар ===
-    const bar = await loadBarStats(zReport.session_number);
+    const bar = await loadBarStats(zReport.session_number, DEVICE_ID);
 
-    // === Гизмо: выбор смены по времени, потом расчёт по транзакциям ===
     let gizmoShift = null;
     let gizmoTotals = null;
 
@@ -1043,20 +1032,18 @@ async function main() {
     const gizmoBonuses = gizmoTotals?.bonuses ?? [];
     const gizmoBonusesTotal = gizmoTotals?.bonusesTotal ?? 0;
 
-    // ✅ загрузим статусы бонусов из bonus_tasks для этой смены Gizmo
     const bonusTasks = gizmoShift?.shift_id ? await loadBonusTasksForShift(gizmoShift.shift_id) : [];
 
     const openTime = times.opened_at;
     const closeTime = times.closed_at;
     const openDate = formatDateTime(openTime);
-    const closeDate  = formatDateTime(closeTime);
+    const closeDate = formatDateTime(closeTime);
     const shiftType = shiftTypeFromDate(closeTime);
 
-  let text =
-    `*${shiftType}* смена\n` +
-    `открыта *${openDate}*\n` +
-    `закрыта *${closeDate}*\n\n`;
-
+    let text =
+      `*${shiftType}* смена\n` +
+      `открыта *${openDate}*\n` +
+      `закрыта *${closeDate}*\n\n`;
 
     text += `*Эвотор* смена *№${zReport.session_number}*\n`;
     text += `Нал: ${money(zCash)} ₽\n`;
@@ -1091,10 +1078,8 @@ async function main() {
     text += `Безнал: ${money(diffElectron)} ₽\n`;
     text += `Итого: *${money(diffTotal)}* ₽`;
 
-    // ----- отправка текстового отчёта -----
     if (chatId) await send(chatId, text, { parse_mode: 'Markdown' });
 
-    // ----- таблица бонусов (С ДОБАВЛЕННОЙ КОЛОНКОЙ "Статус") -----
     if (chatId && gizmoBonuses.length) {
       try {
         const header = ['Время', 'Клиент', 'Бонус', 'Статус'];
@@ -1140,10 +1125,11 @@ async function main() {
     }
   } catch (e) {
     console.error('evotorSessionReport error:', e);
-    if (chatId)
+    if (chatId) {
       try {
         await send(chatId, '❗ Ошибка при формировании отчёта.', { parse_mode: 'Markdown' });
       } catch {}
+    }
   }
 }
 

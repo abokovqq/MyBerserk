@@ -1,5 +1,6 @@
+// MyBerserk
 // src/tools/evotorSalesNormalReport.mjs
-// Отчёт по продажам Evotor: NORMAL + "Своя еда" по смене (session_number)
+// Отчёт по продажам Evotor: NORMAL + "Своя еда" по смене (session_number + DEVICE_ID)
 
 import '../env.js';
 import { q } from '../db.js';
@@ -18,7 +19,7 @@ function parseDateFlexible(dt) {
   let d = new Date(raw);
   if (!Number.isNaN(d.getTime())) return d;
 
-  d = new Date(raw.replace(" ", "T"));
+  d = new Date(raw.replace(' ', 'T'));
   if (!Number.isNaN(d.getTime())) return d;
 
   return null;
@@ -26,8 +27,8 @@ function parseDateFlexible(dt) {
 
 function fmtTime(dt) {
   const d = parseDateFlexible(dt);
-  if (!d) return "--:--:--";
-  const pad = (n) => String(n).padStart(2, "0");
+  if (!d) return '--:--:--';
+  const pad = (n) => String(n).padStart(2, '0');
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
@@ -44,18 +45,30 @@ function getArg(name, def = null) {
   return found.substring(pref.length);
 }
 
-let sessionNumber = getArg("shift", null);
+let sessionNumber = getArg('shift', null);
 if (!sessionNumber) {
-  const pos = argv.find((a) => !a.startsWith("--"));
+  const pos = argv.find((a) => !a.startsWith('--'));
   if (pos) sessionNumber = pos;
 }
 
 if (!sessionNumber) {
-  console.log("Использование:\n  node evotorSalesNormalReport.mjs --shift=1401");
+  console.log('Использование:\n  node src/tools/evotorSalesNormalReport.mjs --shift=1401');
   process.exit(1);
 }
 
-console.log(`Загружаю NORMAL + "Своя еда" по Evotor смене № ${sessionNumber}\n`);
+// ---------------------------------------------------------------------
+// ENV
+// ---------------------------------------------------------------------
+
+const deviceId = String(process.env.DEVICE_ID || '').trim();
+
+if (!deviceId) {
+  console.error('Ошибка: в env не задан DEVICE_ID');
+  process.exit(1);
+}
+
+console.log(`Загружаю NORMAL + "Своя еда" по Evotor смене № ${sessionNumber}`);
+console.log(`DEVICE_ID: ${deviceId}\n`);
 
 // ---------------------------------------------------------------------
 // SQL выборка
@@ -73,13 +86,14 @@ SELECT
   discount_sum
 FROM evotor_sales
 WHERE session_number = ?
+  AND device_id = ?
   AND (
        product_type = 'NORMAL'
        OR product_name = 'Своя еда'
   )
 ORDER BY close_date ASC
 `,
-  [sessionNumber]
+  [sessionNumber, deviceId]
 );
 
 // ---------------------------------------------------------------------
@@ -97,20 +111,19 @@ for (const r of rows) {
   const time = fmtTime(r.close_date);
 
   const sum = Number(r.result_sum || 0);
-  const pay = (r.payments_type || "").padEnd(8);
+  const pay = String(r.payments_type || '').padEnd(8);
 
   const type =
-    r.product_name === "Своя еда" ? "Своя еда" : r.product_type;
+    r.product_name === 'Своя еда' ? 'Своя еда' : String(r.product_type || '');
 
-  const name = (r.product_name || "").slice(0, 60);
+  const name = String(r.product_name || '').slice(0, 60);
 
   const discount = Number(r.discount_sum || 0);
   const discountText =
-    discount > 0 ? `-${discount.toFixed(2).padStart(7)}` : "       ";
+    discount > 0 ? `-${discount.toFixed(2).padStart(7)}` : '       ';
 
-  // Итоги
-  if (r.payments_type === "CASH") totalCash += sum;
-  if (r.payments_type === "ELECTRON") totalNonCash += sum;
+  if (r.payments_type === 'CASH') totalCash += sum;
+  if (r.payments_type === 'ELECTRON') totalNonCash += sum;
 
   console.log(
     `${time} | ${sum.toFixed(2).padStart(8)} | ${discountText} | ${pay} | ${type.padEnd(10)} | ${name}`
@@ -123,8 +136,8 @@ for (const r of rows) {
 
 const total = totalCash + totalNonCash;
 
-console.log("\n=======================================");
+console.log('\n=======================================');
 console.log(`НАЛ:      ${totalCash.toFixed(2)}`);
 console.log(`БЕЗНАЛ:   ${totalNonCash.toFixed(2)}`);
 console.log(`ИТОГО:    ${total.toFixed(2)}`);
-console.log("=======================================\n");
+console.log('=======================================\n');
