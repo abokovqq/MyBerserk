@@ -15,6 +15,9 @@ const TOKEN     = process.env.EVOTOR_ACCESS_TOKEN;
 const LOAD_ALL_SESSIONS =
   String(process.env.LOAD_ALL_SESSIONS || '').toLowerCase() === 'true';
 
+// корень проекта
+const APP_DIR = '/home/a/abokovsa/berserkclub.ru/MyBerserk';
+
 // путь к .env
 const ENV_FILE = '/home/a/abokovsa/berserkclub.ru/MyBerserk/.env';
 
@@ -48,6 +51,7 @@ function envBool(name, def = false) {
 function setEnvFlag(name, value) {
   const valStr = String(value);
   let content = '';
+
   try {
     content = fs.readFileSync(ENV_FILE, 'utf8');
   } catch (e) {
@@ -72,6 +76,7 @@ function setEnvFlag(name, value) {
   }
 
   const newContent = newLines.join('\n');
+
   try {
     fs.writeFileSync(ENV_FILE, newContent, 'utf8');
     process.env[name] = valStr; // обновим в текущем процессе
@@ -89,7 +94,7 @@ const NODE_BIN = '/home/a/abokovsa/opt/node/bin/node';
 // где лежат скрипты отчётов
 const PRODUCTS_REPORT =
   '/home/a/abokovsa/berserkclub.ru/MyBerserk/src/tools/evotorProductsReport.mjs';
-const SESSION_REPORT  =
+const SESSION_REPORT =
   '/home/a/abokovsa/berserkclub.ru/MyBerserk/src/tools/evotorSessionReport.mjs';
 
 async function getLastSessionMs() {
@@ -97,6 +102,7 @@ async function getLastSessionMs() {
     SELECT UNIX_TIMESTAMP(MAX(close_date)) * 1000 AS ts
     FROM evotor_sessions
   `);
+
   return rows[0].ts ? Number(rows[0].ts) : null;
 }
 
@@ -108,17 +114,22 @@ async function getLastClosedSession() {
      ORDER BY close_date DESC
      LIMIT 1
   `);
+
   return rows[0] || null;
 }
 
 // проверка наличия Z-отчёта по session_id
 async function hasZReport(sessionId) {
-  const rows = await q(`
+  const rows = await q(
+    `
     SELECT 1
       FROM evotor_z_reports
      WHERE session_id = ?
      LIMIT 1
-  `, [sessionId]);
+  `,
+    [sessionId],
+  );
+
   return rows.length > 0;
 }
 
@@ -137,7 +148,7 @@ async function fetchPage({ since, cursor }) {
   const res = await fetch(url, {
     headers: {
       'X-Authorization': TOKEN,
-      'Accept': 'application/vnd.evotor.v2+json',
+      Accept: 'application/vnd.evotor.v2+json',
     },
   });
 
@@ -178,9 +189,8 @@ async function saveSession(doc) {
   ]);
 
   // для INSERT IGNORE mysql2 возвращает объект с affectedRows
-  const affected = res && typeof res.affectedRows === 'number'
-    ? res.affectedRows
-    : 0;
+  const affected =
+    res && typeof res.affectedRows === 'number' ? res.affectedRows : 0;
 
   return affected > 0;
 }
@@ -188,13 +198,30 @@ async function saveSession(doc) {
 // ===== запуск отчётов по закрытой смене =====
 function runReport(scriptPath, args) {
   return new Promise((resolve, reject) => {
+    console.log('evotorSessions: runReport start:', {
+      node: NODE_BIN,
+      scriptPath,
+      cwd: APP_DIR,
+      args,
+    });
+
     const child = spawn(NODE_BIN, [scriptPath, ...args], {
+      cwd: APP_DIR,
+      env: process.env,
       stdio: 'inherit',
     });
 
-    child.on('exit', code => {
-      if (code === 0) resolve();
-      else reject(new Error(`${scriptPath} exited with code ${code}`));
+    child.on('error', err => {
+      reject(err);
+    });
+
+    child.on('close', code => {
+      if (code === 0) {
+        console.log(`evotorSessions: runReport OK: ${scriptPath}`);
+        resolve();
+      } else {
+        reject(new Error(`${scriptPath} exited with code ${code}`));
+      }
     });
   });
 }
@@ -202,7 +229,7 @@ function runReport(scriptPath, args) {
 async function runReportsForClosedSession(sessionId, sessionNumber) {
   if (!TG_CHAT_REPORT) {
     console.log(
-      'evotorSessions: TG_CHAT_REPORT не задан, отчёты по смене не шлём'
+      'evotorSessions: TG_CHAT_REPORT не задан, отчёты по смене не шлём',
     );
     return;
   }
@@ -213,22 +240,40 @@ async function runReportsForClosedSession(sessionId, sessionNumber) {
     '--preferOpen=false', // по закрытой смене явно
   ];
 
-  try {
-    console.log(
-      `evotorSessions: запускаем отчёты по закрытой смене session_id=${sessionId}, session_number=${sessionNumber}`
-    );
+  console.log(
+    `evotorSessions: запускаем отчёты по закрытой смене session_id=${sessionId}, session_number=${sessionNumber}`,
+  );
 
-    await Promise.all([
-      runReport(SESSION_REPORT, argsCommon),
-      runReport(PRODUCTS_REPORT, argsCommon),
-    ]);
+  const results = await Promise.allSettled([
+    runReport(SESSION_REPORT, argsCommon),
+    runReport(PRODUCTS_REPORT, argsCommon),
+  ]);
 
-  } catch (e) {
-    console.error(
-      'evotorSessions: ошибка при запуске отчётов по смене:',
-      e.message
+  const failed = results
+    .map((r, idx) => ({
+      idx,
+      name: idx === 0 ? 'SESSION_REPORT' : 'PRODUCTS_REPORT',
+      script: idx === 0 ? SESSION_REPORT : PRODUCTS_REPORT,
+      result: r,
+    }))
+    .filter(x => x.result.status === 'rejected');
+
+  if (failed.length > 0) {
+    for (const f of failed) {
+      console.error(
+        `evotorSessions: отчёт ${f.name} упал:`,
+        f.result.reason?.stack || f.result.reason?.message || f.result.reason,
+      );
+    }
+
+    throw new Error(
+      `Ошибка формирования отчётов: ${failed.map(f => f.name).join(', ')}`,
     );
   }
+
+  console.log(
+    `evotorSessions: отчёты успешно сформированы по session_id=${sessionId}, session_number=${sessionNumber}`,
+  );
 }
 
 (async () => {
@@ -238,18 +283,19 @@ async function runReportsForClosedSession(sessionId, sessionNumber) {
     if (!LOAD_ALL_SESSIONS) {
       const last = await getLastSessionMs();
       since = last ? last + 1 : null;
+
       if (since) {
         console.log(
           `evotorSessions: incremental since=${since} (${new Date(
-            since
-          ).toISOString()})`
+            since,
+          ).toISOString()})`,
         );
       } else {
         console.log('evotorSessions: первая полная загрузка (since=null)');
       }
     } else {
       console.log(
-        'evotorSessions: LOAD_ALL_SESSIONS=true → загружаем все сессии'
+        'evotorSessions: LOAD_ALL_SESSIONS=true → загружаем все сессии',
       );
     }
 
@@ -264,6 +310,7 @@ async function runReportsForClosedSession(sessionId, sessionNumber) {
 
       for (const doc of items) {
         const inserted = await saveSession(doc);
+
         if (inserted) {
           total++;
 
@@ -285,7 +332,7 @@ async function runReportsForClosedSession(sessionId, sessionNumber) {
 
     // === флаги закрытия смены ===
     let flagEvotor = envBool('SESSION_CLOSED_EVOTOR', false);
-    let flagGizmo  = envBool('SESSION_CLOSED_GIZMO', false);
+    let flagGizmo = envBool('SESSION_CLOSED_GIZMO', false);
 
     // последняя смена, закрытая именно в ЭТОМ запуске
     let justClosedSessionId = null;
@@ -301,8 +348,9 @@ async function runReportsForClosedSession(sessionId, sessionNumber) {
 
       setEnvFlag('SESSION_CLOSED_EVOTOR', 1);
       flagEvotor = true;
+
       console.log(
-        `evotorSessions: SESSION_CLOSED_EVOTOR=1 (новая CLOSE_SESSION, session_id=${justClosedSessionId}, session_number=${justClosedSessionNumber})`
+        `evotorSessions: SESSION_CLOSED_EVOTOR=1 (новая CLOSE_SESSION, session_id=${justClosedSessionId}, session_number=${justClosedSessionNumber})`,
       );
     }
 
@@ -316,6 +364,7 @@ async function runReportsForClosedSession(sessionId, sessionNumber) {
       // (флаги были выставлены ранее) — берём последнюю закрытую из БД
       if (!sessionId) {
         const lastClosed = await getLastClosedSession();
+
         if (lastClosed) {
           sessionId = lastClosed.session_id;
           sessionNumber = lastClosed.session_number;
@@ -327,40 +376,40 @@ async function runReportsForClosedSession(sessionId, sessionNumber) {
 
         if (!zExists) {
           console.log(
-            `evotorSessions: Z-отчёт по session_id=${sessionId} ещё не загружен, отчёты не запускаем`
+            `evotorSessions: Z-отчёт по session_id=${sessionId} ещё не загружен, отчёты не запускаем`,
           );
 
           // сообщение в чат: Z-отчёт формируется
           if (TG_CHAT_REPORT) {
             await send(
               TG_CHAT_REPORT,
-              'Z-отчёт Evotor формируется, ожидайте...'
+              'Z-отчёт Evotor формируется, ожидайте...',
             );
           }
-
         } else {
-          // Z-отчёт есть → нормальный цикл: отчёт + сброс обоих флагов
+          // Z-отчёт есть → сначала отчёты, потом сброс обоих флагов
+          await runReportsForClosedSession(sessionId, sessionNumber);
+
           setEnvFlag('SESSION_CLOSED_EVOTOR', 0);
           setEnvFlag('SESSION_CLOSED_GIZMO', 0);
           console.log('evotorSessions: флаги SESSION_CLOSED_* сброшены в 0');
-          await runReportsForClosedSession(sessionId, sessionNumber);
         }
       } else {
         console.warn(
-          'evotorSessions: SESSION_CLOSED_EVOTOR=1 и SESSION_CLOSED_GIZMO=1, но не нашли закрытую смену'
+          'evotorSessions: SESSION_CLOSED_EVOTOR=1 и SESSION_CLOSED_GIZMO=1, но не нашли закрытую смену',
         );
       }
-
     } else {
       console.log(
         `evotorSessions: флаги закрытия — EVOTOR=${
           flagEvotor ? 1 : 0
-        }, GIZMO=${flagGizmo ? 1 : 0}`
+        }, GIZMO=${flagGizmo ? 1 : 0}`,
       );
     }
   } catch (e) {
-    console.error('evotorSessions error:', e.message);
+    console.error('evotorSessions error:', e?.stack || e?.message || e);
+    process.exitCode = 1;
   } finally {
-    process.exit(0);
+    process.exit(process.exitCode || 0);
   }
 })();

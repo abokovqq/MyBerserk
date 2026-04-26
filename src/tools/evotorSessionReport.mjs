@@ -84,8 +84,10 @@ function formatDateTime(dtStr) {
 function formatTimeHM(dt) {
   const d = dt instanceof Date ? dt : parseDateFlexible(dt);
   if (!d) return '--:--';
+
   const hh = String(d.getHours()).padStart(2, '0');
   const mi = String(d.getMinutes()).padStart(2, '0');
+
   return `${hh}:${mi}`;
 }
 
@@ -94,6 +96,7 @@ function formatTimeHM(dt) {
 function shiftTypeFromDate(dtStr) {
   const d = parseDateFlexible(dtStr);
   if (!d) return 'Дневная';
+
   const h = d.getHours();
   return h >= 4 && h < 16 ? 'Ночная' : 'Дневная';
 }
@@ -113,6 +116,7 @@ function toMySQLDateTime(d) {
   const hh = String(date.getHours()).padStart(2, '0');
   const mi = String(date.getMinutes()).padStart(2, '0');
   const ss = String(date.getSeconds()).padStart(2, '0');
+
   return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
 }
 
@@ -137,6 +141,7 @@ function monthSheetRuByMonthIndex(m0) {
     'Ноябрь',
     'Декабрь',
   ];
+
   return names[m0] || null;
 }
 
@@ -174,6 +179,7 @@ function runGsCashUpdate({ monthSheet, year, day, shift, cashRevenue }) {
 
     let out = '';
     let err = '';
+
     p.stdout.on('data', d => (out += d.toString()));
     p.stderr.on('data', d => (err += d.toString()));
 
@@ -208,6 +214,7 @@ async function findOpenSession() {
   `,
     [DEVICE_ID],
   );
+
   return rows[0] || null;
 }
 
@@ -223,6 +230,7 @@ async function findLastClosedSession() {
   `,
     [DEVICE_ID],
   );
+
   return rows[0] || null;
 }
 
@@ -239,6 +247,7 @@ async function findBySessionNumber(sessionNumber) {
   `,
     [sessionNumber, DEVICE_ID],
   );
+
   if (closed.length) return closed[0];
 
   const open = await q(
@@ -253,6 +262,7 @@ async function findBySessionNumber(sessionNumber) {
   `,
     [sessionNumber, DEVICE_ID],
   );
+
   return open[0] || null;
 }
 
@@ -269,6 +279,7 @@ async function findBySessionId(sessionId) {
   `,
     [sessionId, DEVICE_ID],
   );
+
   if (closed.length) return closed[0];
 
   const open = await q(
@@ -283,6 +294,7 @@ async function findBySessionId(sessionId) {
   `,
     [sessionId, DEVICE_ID],
   );
+
   return open[0] || null;
 }
 
@@ -321,9 +333,13 @@ async function loadSessionTimes(sessionId) {
 
   for (const r of rows) {
     if (r.evotor_type === 'OPEN_SESSION') {
-      if (!opened_at || new Date(r.close_date) < new Date(opened_at)) opened_at = r.close_date;
+      if (!opened_at || new Date(r.close_date) < new Date(opened_at)) {
+        opened_at = r.close_date;
+      }
     } else if (r.evotor_type === 'CLOSE_SESSION') {
-      if (!closed_at || new Date(r.close_date) > new Date(closed_at)) closed_at = r.close_date;
+      if (!closed_at || new Date(r.close_date) > new Date(closed_at)) {
+        closed_at = r.close_date;
+      }
     }
   }
 
@@ -344,6 +360,7 @@ async function loadZReport(sessionId) {
   `,
     [sessionId],
   );
+
   return rows[0] || null;
 }
 
@@ -358,9 +375,10 @@ async function loadLastGizmoShift() {
       ORDER BY end_time DESC
       LIMIT 1
     `);
+
     return rows[0] || null;
   } catch (e) {
-    console.error('loadLastGizmoShift error:', e);
+    console.error('loadLastGizmoShift error:', e?.stack || e);
     return null;
   }
 }
@@ -395,7 +413,7 @@ async function loadGizmoShiftNearEvotorClose(evotorClose) {
 
     return rows[0] || null;
   } catch (e) {
-    console.error('loadGizmoShiftNearEvotorClose error:', e);
+    console.error('loadGizmoShiftNearEvotorClose error:', e?.stack || e);
     return null;
   }
 }
@@ -428,6 +446,7 @@ async function loadBarStats(sessionNumber, deviceId) {
 
 function toGizmoTime(d) {
   const pad = n => String(n).padStart(2, '0');
+
   return (
     d.getFullYear() +
     '-' +
@@ -479,7 +498,8 @@ function dbgRowFromGizmoTx(t) {
   const title = safeStr(t.title).trim();
   const op = safeStr(t.operatorName).trim();
   const method = safeStr(t.paymentMethodName).trim();
-  const amount = t.total != null ? Number(t.total) : t.value != null ? Number(t.value) : 0;
+  const amount =
+    t.total != null ? Number(t.total) : t.value != null ? Number(t.value) : 0;
 
   return {
     dt: safeStr(t.transactionDate),
@@ -507,12 +527,15 @@ function dbgRowFromPayment(g) {
 
 function dbgPrintBlock(title, rows, maxRows = 80) {
   console.log('\n==================== ' + title + ' ====================');
+
   if (!rows || !rows.length) {
     console.log('(empty)');
     return;
   }
+
   const slice = rows.slice(0, maxRows);
   console.table(slice);
+
   if (rows.length > maxRows) {
     console.log(`... (${rows.length - maxRows} more rows)`);
   }
@@ -521,8 +544,10 @@ function dbgPrintBlock(title, rows, maxRows = 80) {
 // ✅ Deposit Void учитываем ТОЛЬКО для Cash / Credit Card
 function isCashOrCreditCardMethod(methodName) {
   const ml = String(methodName || '').toLowerCase();
+
   if (ml === 'cash') return true;
   if (ml.includes('credit') && ml.includes('card')) return true;
+
   return false;
 }
 
@@ -530,9 +555,11 @@ function isCashOrCreditCardMethod(methodName) {
 
 function normalizeBonusStatusDbToLabel(statusRaw) {
   const s = String(statusRaw || '').toLowerCase().trim();
+
   if (s === 'promo') return 'акция';
   if (s === 'boss') return 'босс';
   if (s === 'admin') return 'админ';
+
   return 'нет';
 }
 
@@ -559,7 +586,9 @@ function findBestBonusTaskMatch(bonus, tasks) {
 
     const tName = normalizeName(t.client_name);
     const nameOk =
-      (bName && tName && (bName === tName || bName.includes(tName) || tName.includes(bName))) ||
+      (bName &&
+        tName &&
+        (bName === tName || bName.includes(tName) || tName.includes(bName))) ||
       (!bName && !tName);
 
     if (!nameOk) continue;
@@ -578,6 +607,7 @@ function findBestBonusTaskMatch(bonus, tasks) {
 
 async function loadBonusTasksForShift(shiftId) {
   if (!shiftId) return [];
+
   try {
     const rows = await q(
       `
@@ -596,7 +626,7 @@ async function loadBonusTasksForShift(shiftId) {
       status: r.status,
     }));
   } catch (e) {
-    console.error('loadBonusTasksForShift error:', e);
+    console.error('loadBonusTasksForShift error:', e?.stack || e);
     return [];
   }
 }
@@ -615,6 +645,7 @@ async function calcGizmoTotalsForShift(shiftId) {
     );
 
     if (!shiftRows.length) return null;
+
     const shift = shiftRows[0];
 
     if (!shift.start_time || !shift.end_time) return null;
@@ -638,13 +669,14 @@ async function calcGizmoTotalsForShift(shiftId) {
     });
 
     let gizmoResp;
+
     try {
       gizmoResp = await gizmoFetch(`/api/reports/transactionslog?${params}`, {
         method: 'GET',
         apiVersion: 1,
       });
     } catch (e) {
-      console.error('calcGizmoTotalsForShift: gizmoFetch error:', e);
+      console.error('calcGizmoTotalsForShift: gizmoFetch error:', e?.stack || e);
       return null;
     }
 
@@ -674,26 +706,36 @@ async function calcGizmoTotalsForShift(shiftId) {
       const okOp = op === '' || operators.has(op);
       if (!okOp) continue;
 
-      if (tl.startsWith('auto invoice') || tl.startsWith('auto payment')) continue;
+      if (tl.startsWith('auto invoice') || tl.startsWith('auto payment')) {
+        continue;
+      }
 
       if (tl === 'void') continue;
 
-      const isDepositVoid = tl === 'deposit void' || (tl.startsWith('deposit') && tl.includes('void'));
+      const isDepositVoid =
+        tl === 'deposit void' || (tl.startsWith('deposit') && tl.includes('void'));
+
       let titleNorm = title;
+
       if (isDepositVoid) {
         if (!isCashOrCreditCardMethod(method)) {
           continue;
         }
+
         titleNorm = 'Withdraw';
       }
 
       let isMoney = false;
 
-      if (tl === 'payment' || tl === 'deposit' || tl === 'withdraw') isMoney = true;
+      if (tl === 'payment' || tl === 'deposit' || tl === 'withdraw') {
+        isMoney = true;
+      }
 
       if (titleNorm === 'Withdraw') isMoney = true;
 
-      if (tl.includes('refund') || tl.includes('return') || tl.includes('возврат')) isMoney = true;
+      if (tl.includes('refund') || tl.includes('return') || tl.includes('возврат')) {
+        isMoney = true;
+      }
 
       if (ml.includes('бонус')) isMoney = true;
 
@@ -718,8 +760,8 @@ async function calcGizmoTotalsForShift(shiftId) {
         amount,
         payType,
         method,
-        title: title,
-        titleNorm: titleNorm,
+        title,
+        titleNorm,
         customer: t.customerName || '',
       });
     }
@@ -733,31 +775,44 @@ async function calcGizmoTotalsForShift(shiftId) {
     const beforeCount = gizmoPayments.length;
 
     const totalsByInvoice = new Map();
+
     for (const g of gizmoPayments) {
       if (!g.id) continue;
+
       const cur = totalsByInvoice.get(g.id) || 0;
       totalsByInvoice.set(g.id, cur + g.amount);
     }
 
     const cancelledInvoices = new Set(
-      [...totalsByInvoice.entries()].filter(([, sum]) => nearlyEqual(sum, 0)).map(([id]) => id),
+      [...totalsByInvoice.entries()]
+        .filter(([, sum]) => nearlyEqual(sum, 0))
+        .map(([id]) => id),
     );
 
     if (cancelledInvoices.size) {
-      console.log('\nGIZMO DEBUG: cancelledInvoices (sum ~ 0):', Array.from(cancelledInvoices.values()));
+      console.log(
+        '\nGIZMO DEBUG: cancelledInvoices (sum ~ 0):',
+        Array.from(cancelledInvoices.values()),
+      );
     }
 
-    gizmoPayments = gizmoPayments.filter(g => !(g.id && cancelledInvoices.has(g.id)));
+    gizmoPayments = gizmoPayments.filter(
+      g => !(g.id && cancelledInvoices.has(g.id)),
+    );
 
     const bonusByCustomer = new Map();
+
     gizmoPayments.forEach((g, idx) => {
       if (g.payType !== 'bonus') return;
+
       const key = g.customer || '(no name)';
       let arr = bonusByCustomer.get(key);
+
       if (!arr) {
         arr = [];
         bonusByCustomer.set(key, arr);
       }
+
       arr.push({ g, idx });
     });
 
@@ -783,6 +838,7 @@ async function calcGizmoTotalsForShift(shiftId) {
           if (!nearlyEqual(pos.g.amount, -neg.g.amount)) continue;
 
           const diff = Math.abs(pos.g.time - neg.g.time);
+
           if (diff < bestDt) {
             bestDt = diff;
             bestPosIdx = i;
@@ -791,8 +847,10 @@ async function calcGizmoTotalsForShift(shiftId) {
 
         if (bestPosIdx >= 0) {
           const pos = positives[bestPosIdx];
+
           bonusToRemove.add(pos.idx);
           bonusToRemove.add(neg.idx);
+
           positives[bestPosIdx] = null;
         }
       }
@@ -806,6 +864,7 @@ async function calcGizmoTotalsForShift(shiftId) {
     const DEP_WD_WINDOW_MS = 30 * 60 * 1000;
 
     const depWdByKey = new Map();
+
     gizmoPayments.forEach((g, idx) => {
       if (g.payType === 'bonus') return;
 
@@ -813,11 +872,14 @@ async function calcGizmoTotalsForShift(shiftId) {
       if (tnorm !== 'deposit' && tnorm !== 'withdraw') return;
 
       const key = `${g.customer || '(no name)'}|${g.method || ''}|${g.payType}`;
+
       let arr = depWdByKey.get(key);
+
       if (!arr) {
         arr = [];
         depWdByKey.set(key, arr);
       }
+
       arr.push({ g, idx });
     });
 
@@ -829,6 +891,7 @@ async function calcGizmoTotalsForShift(shiftId) {
           x.g.amount > 0 &&
           String(x.g.titleNorm || x.g.title || '').toLowerCase() === 'deposit',
       );
+
       const negatives = ops.filter(
         x =>
           x.g.amount < 0 &&
@@ -844,6 +907,7 @@ async function calcGizmoTotalsForShift(shiftId) {
           if (!nearlyEqual(pos.g.amount, -neg.g.amount)) continue;
 
           const diff = Math.abs(pos.g.time - neg.g.time);
+
           if (diff <= DEP_WD_WINDOW_MS && diff < bestDt) {
             bestDt = diff;
             best = pos;
@@ -891,6 +955,7 @@ async function calcGizmoTotalsForShift(shiftId) {
           customer: g.customer,
           amount: g.amount,
         });
+
         bonusesTotal += g.amount;
       }
     }
@@ -898,6 +963,7 @@ async function calcGizmoTotalsForShift(shiftId) {
     bonuses.sort((a, b) => {
       const ta = a.time ? a.time.getTime() : 0;
       const tb = b.time ? b.time.getTime() : 0;
+
       return ta - tb;
     });
 
@@ -917,7 +983,7 @@ async function calcGizmoTotalsForShift(shiftId) {
       bonusesTotal,
     };
   } catch (e) {
-    console.error('calcGizmoTotalsForShift error:', e);
+    console.error('calcGizmoTotalsForShift error:', e?.stack || e);
     return null;
   }
 }
@@ -932,41 +998,100 @@ async function sendPhoto({ chatId, filePath, caption }) {
 
   const form = new FormData();
   form.append('chat_id', String(chatId));
+
   if (caption) {
     form.append('caption', caption);
     form.append('parse_mode', 'Markdown');
   }
+
   form.append('photo', blob, 'gizmo_bonuses.png');
 
   const res = await fetch(url, { method: 'POST', body: form });
   const text = await res.text();
+
   if (!res.ok) throw new Error(`TG sendPhoto: ${text}`);
+
   console.log('TG sendPhoto OK:', text);
-  console.log('TG sendPhoto OK:', text);
+}
+
+// ===== MAIN ERROR STEP LOGGER =====
+
+let REPORT_STEP = 'init';
+
+function setReportStep(step, extra = null) {
+  REPORT_STEP = step;
+
+  if (extra) {
+    console.log(`[evotorSessionReport] STEP: ${step}`, extra);
+  } else {
+    console.log(`[evotorSessionReport] STEP: ${step}`);
+  }
+}
+
+function logReportError(e) {
+  console.error('================ evotorSessionReport FATAL ================');
+  console.error('STEP:', REPORT_STEP);
+
+  if (e?.stack) {
+    console.error(e.stack);
+  } else {
+    console.error(e);
+  }
+
+  console.error('===========================================================');
 }
 
 // =============================================================
 
 async function main() {
   try {
+    setReportStep('start', {
+      cwd: process.cwd(),
+      execPath: process.execPath,
+      argv,
+      chatId,
+      sessionIdArg,
+      sessionNumberArg,
+      preferOpen,
+    });
+
     console.log(`DEVICE_ID: ${DEVICE_ID}`);
 
+    setReportStep('resolveSession');
     const session = await resolveSession();
 
     if (!session) {
-      if (chatId) await send(chatId, '❗ Не удалось найти кассовую смену.');
+      setReportStep('session_not_found');
+
+      if (chatId) {
+        await send(chatId, '❗ Не удалось найти кассовую смену.');
+      }
+
       return;
     }
 
     const { session_id } = session;
 
+    setReportStep('loadSessionTimes', { session_id });
     const times = await loadSessionTimes(session_id);
+
+    setReportStep('loadZReport', { session_id });
     const zReport = await loadZReport(session_id);
 
     if (!zReport) {
-      if (chatId) await send(chatId, '❗ Не найден Z-отчёт Evotor для этой смены.');
+      setReportStep('z_report_not_found', { session_id });
+
+      if (chatId) {
+        await send(chatId, '❗ Не найден Z-отчёт Evotor для этой смены.');
+      }
+
       return;
     }
+
+    setReportStep('parseZReportValues', {
+      session_id,
+      session_number: zReport.session_number,
+    });
 
     const zTotal = Number(zReport.z_total ?? 0);
     const zCash = Number(zReport.z_cash ?? 0);
@@ -977,6 +1102,8 @@ async function main() {
     const refundElectron = Number(zReport.z_refund_electron ?? 0);
 
     if (GS_CASHUPDATE_ENABLED) {
+      setReportStep('gsCashUpdate');
+
       try {
         const opened = parseDateFlexible(times.opened_at);
         if (!opened) throw new Error('opened_at is null/invalid');
@@ -1004,9 +1131,14 @@ async function main() {
 
         console.log('GS cash update: OK');
       } catch (e) {
-        console.error('GS cash update: FAIL:', e?.message || e);
+        console.error('GS cash update: FAIL:', e?.stack || e?.message || e);
       }
     }
+
+    setReportStep('loadBarStats', {
+      session_number: zReport.session_number,
+      device_id: DEVICE_ID,
+    });
 
     const bar = await loadBarStats(zReport.session_number, DEVICE_ID);
 
@@ -1014,6 +1146,11 @@ async function main() {
     let gizmoTotals = null;
 
     const baseTime = times.closed_at || times.opened_at;
+
+    setReportStep('loadGizmoShift', {
+      sessionNumberArg,
+      baseTime,
+    });
 
     if (sessionNumberArg && baseTime) {
       gizmoShift = await loadGizmoShiftNearEvotorClose(baseTime);
@@ -1023,7 +1160,13 @@ async function main() {
     }
 
     if (gizmoShift?.shift_id) {
+      setReportStep('calcGizmoTotalsForShift', {
+        shift_id: gizmoShift.shift_id,
+      });
+
       gizmoTotals = await calcGizmoTotalsForShift(gizmoShift.shift_id);
+    } else {
+      setReportStep('gizmoShift_not_found');
     }
 
     const gizmoCash = gizmoTotals?.cash ?? 0;
@@ -1032,7 +1175,15 @@ async function main() {
     const gizmoBonuses = gizmoTotals?.bonuses ?? [];
     const gizmoBonusesTotal = gizmoTotals?.bonusesTotal ?? 0;
 
-    const bonusTasks = gizmoShift?.shift_id ? await loadBonusTasksForShift(gizmoShift.shift_id) : [];
+    setReportStep('loadBonusTasks', {
+      shift_id: gizmoShift?.shift_id || null,
+    });
+
+    const bonusTasks = gizmoShift?.shift_id
+      ? await loadBonusTasksForShift(gizmoShift.shift_id)
+      : [];
+
+    setReportStep('buildMainText');
 
     const openTime = times.opened_at;
     const closeTime = times.closed_at;
@@ -1078,15 +1229,28 @@ async function main() {
     text += `Безнал: ${money(diffElectron)} ₽\n`;
     text += `Итого: *${money(diffTotal)}* ₽`;
 
-    if (chatId) await send(chatId, text, { parse_mode: 'Markdown' });
+    setReportStep('sendMainReport', {
+      chatId,
+      textLength: text.length,
+    });
+
+    if (chatId) {
+      await send(chatId, text, { parse_mode: 'Markdown' });
+    }
 
     if (chatId && gizmoBonuses.length) {
+      setReportStep('sendGizmoBonusesTable', {
+        bonusesCount: gizmoBonuses.length,
+      });
+
       try {
         const header = ['Время', 'Клиент', 'Бонус', 'Статус'];
 
         const body = gizmoBonuses.map(b => {
           const match = findBestBonusTaskMatch(b, bonusTasks);
-          const statusLabel = match ? normalizeBonusStatusDbToLabel(match.status) : 'нет';
+          const statusLabel = match
+            ? normalizeBonusStatusDbToLabel(match.status)
+            : 'нет';
 
           return [
             formatTimeHM(b.time),
@@ -1100,7 +1264,9 @@ async function main() {
 
         const table = [header, ...body];
 
-        const outPath = `/tmp/gizmo_bonuses_${zReport.session_number || 'sess'}.png`;
+        const outPath = `/tmp/gizmo_bonuses_${
+          zReport.session_number || 'sess'
+        }.png`;
 
         renderTableToPngWrap(table, {
           outPath,
@@ -1120,15 +1286,29 @@ async function main() {
           console.log('unlink error (ok):', e.message);
         }
       } catch (e) {
-        console.error('Ошибка формирования/отправки таблицы бонусов:', e);
+        console.error(
+          'Ошибка формирования/отправки таблицы бонусов:',
+          e?.stack || e,
+        );
       }
     }
+
+    setReportStep('done');
   } catch (e) {
-    console.error('evotorSessionReport error:', e);
+    logReportError(e);
+    process.exitCode = 1;
+
     if (chatId) {
       try {
-        await send(chatId, '❗ Ошибка при формировании отчёта.', { parse_mode: 'Markdown' });
-      } catch {}
+        await send(chatId, '❗ Ошибка при формировании отчёта.', {
+          parse_mode: 'Markdown',
+        });
+      } catch (sendErr) {
+        console.error(
+          'evotorSessionReport: не удалось отправить сообщение об ошибке:',
+          sendErr?.stack || sendErr,
+        );
+      }
     }
   }
 }
