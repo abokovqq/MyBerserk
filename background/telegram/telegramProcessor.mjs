@@ -238,10 +238,28 @@ function tgMessageText(msg) {
   return '';
 }
 
+function normalizeOnlineInline(line) {
+  let s = String(line ?? '').trim();
+  if (!s) return '';
+
+  s = s.replace(/^👥\s*Онлайн\s*:\s*/iu, '👥 ');
+  s = s.replace(/^Онлайн\s*:\s*/iu, '👥 ');
+  s = s.replace(/\s+/g, ' ').trim();
+
+  return s;
+}
+
 function extractCleaningHeaderLine(msg, fallbackPlace = '') {
   const text = tgMessageText(msg);
+
   if (text) {
-    const lines = text.split(/\r?\n/u);
+    const lines = text
+      .split(/\r?\n/u)
+      .map(v => String(v ?? '').trim())
+      .filter(Boolean);
+
+    let placeLine = '';
+    let onlineLine = '';
 
     for (const raw of lines) {
       let line = String(raw ?? '').trim();
@@ -255,9 +273,31 @@ function extractCleaningHeaderLine(msg, fallbackPlace = '') {
       if (m) line = m[1].trim();
 
       if (/(?:^|[\s])(?:№\s*\d+|No\s*\d+|PC\d+)/iu.test(line)) {
-        return line;
+        if (!placeLine) placeLine = line.replace(/\s+/g, ' ').trim();
+        continue;
+      }
+
+      if (/^👥\s*/u.test(line) || /^Онлайн\s*:/iu.test(line)) {
+        if (!onlineLine) onlineLine = normalizeOnlineInline(line);
+        continue;
       }
     }
+
+    if (placeLine && onlineLine && !/👥/u.test(placeLine)) {
+      return `${placeLine} ${onlineLine}`.replace(/\s+/g, ' ').trim();
+    }
+
+    if (placeLine) {
+      return placeLine;
+    }
+
+    const fb = String(fallbackPlace ?? '').trim();
+
+    if (fb && onlineLine) {
+      return `${fb} ${onlineLine}`.replace(/\s+/g, ' ').trim();
+    }
+
+    if (fb) return fb;
   }
 
   const fb = String(fallbackPlace ?? '').trim();

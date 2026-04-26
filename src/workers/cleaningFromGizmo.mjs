@@ -86,7 +86,7 @@ async function tgSendMessage({ chatId, text, replyMarkup }) {
   return { msgId };
 }
 
-// ===== Онлайн посетители Gizmo =====
+// ===== Онлайн посетители Gizmo по открытым сессиям =====
 async function getOnlineVisitorsCount() {
   const rows = await q(
     `SELECT COUNT(DISTINCT session_id) AS cnt
@@ -304,7 +304,8 @@ for (const sess of sessRows) {
     ]]
   };
 
-  let onlineVisitorsCount = 0;
+  let onlineVisitorsCount = null;
+
   try {
     onlineVisitorsCount = await getOnlineVisitorsCount();
     console.log(`[${TZ}] 👥 Онлайн посетителей Gizmo: ${onlineVisitorsCount}`);
@@ -315,15 +316,10 @@ for (const sess of sessRows) {
   }
 
   const displayPlace = formatPlace(placeId);
-
-  const onlineLine =
-    onlineVisitorsCount === null
-      ? '👥 Онлайн: <b>не удалось определить</b>'
-      : `👥 Онлайн: <b>${onlineVisitorsCount}</b>`;
+  const onlineBadge = onlineVisitorsCount === null ? '👥 ?' : `👥 ${onlineVisitorsCount}`;
 
   const msg =
-    `<b>${displayPlace}</b> ${userName} <b>${timeLabel}</b>\n` +
-    `${onlineLine}\n` +
+    `<b>${displayPlace}</b> ${userName} <b>${timeLabel}</b> ${onlineBadge}\n` +
     `❓ Статус уборки`;
 
   // 4) отправка + сохранение msg_id
