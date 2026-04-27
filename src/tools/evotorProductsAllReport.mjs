@@ -185,11 +185,23 @@ async function main() {
       await renderAndSendGroup(g);
     }
   } catch (e) {
-    console.error('evotorProductsAllReport error:', e);
+    const errText = String(e?.stack || e?.message || e);
+
+    console.error('evotorProductsAllReport error:', errText);
+
     try {
-      await send(chatId, '❗ Ошибка при формировании отчёта по товарам.', {
-        parse_mode: 'Markdown',
-      });
+      await fs.promises.mkdir('/home/a/abokovsa/berserkclub.ru/MyBerserk/logs', { recursive: true });
+      await fs.promises.appendFile(
+        '/home/a/abokovsa/berserkclub.ru/MyBerserk/logs/evotorProductsAllReport.log',
+        `[${new Date().toISOString()}] ERROR\n${errText}\n\n`
+      );
+    } catch {}
+
+    try {
+      await send(
+        chatId,
+        `❗ Ошибка при формировании отчёта по товарам.\n\n${errText.slice(0, 3000)}`
+      );
     } catch {}
   }
 }

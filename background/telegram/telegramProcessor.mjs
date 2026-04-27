@@ -705,29 +705,54 @@ async function processMessage(upd, meta, botToken, logLine) {
     const re = new RegExp(escapeRegExp(bn.toLowerCase()), 'ig');
     clean = clean.replace(re, ' ');
   }
-  clean = clean.replace(/\s+/g, ' ').trim();
+
+  clean = clean
+    .replace(/\u00A0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  logLine(
+    `[message] chat_id=${chatId}`
+    + ` mentioned=${mentioned ? '1' : '0'}`
+    + ` clean="${clean}"`
+    + ` CHAT_INVENTORY=${CHAT_INVENTORY ?? 'null'}`
+  );
 
   if (chatId === CHAT_INVENTORY && mentioned) {
-    if (clean === 'инвентаризация') {
+    const isInventoryStart = /^\/?инвентаризация(?:\s|$|[.!?,:;])/u.test(clean);
+    const isInventoryEnd = /^\/?конецинвент(?:\s|$|[.!?,:;])/u.test(clean);
+
+    logLine(
+      `[inventory] check`
+      + ` start=${isInventoryStart ? '1' : '0'}`
+      + ` end=${isInventoryEnd ? '1' : '0'}`
+      + ` clearFlag=${String(process.env.INVENT_CLEAR_ON_START ?? 'null')}`
+    );
+
+    if (isInventoryStart) {
       let inventFlag = '0';
       if (process.env.INVENT_CLEAR_ON_START) {
         inventFlag = String(process.env.INVENT_CLEAR_ON_START).split('#')[0].trim();
       }
 
       let msgText = '';
+
       if (inventFlag === '1') {
         msgText = 'Формирую лист Data по данным Эвотор…';
+        logLine(`[inventory] TRIGGER inventoryToSheet chatId=${chatId}`);
         runMjsAsync(logLine, INVENTORY_TO_SHEET_MJS, INVENTORY_TO_SHEET_LOG, [`--chatId=${chatId}`]);
       } else {
         msgText = 'Идёт инвентаризация. Повторное обновление данных возможно только после окончания инвентаризации.';
+        logLine(`[inventory] SKIP inventoryToSheet: INVENT_CLEAR_ON_START=${inventFlag}`);
       }
 
       await tgSend(botToken, chatId, msgText);
       return;
     }
 
-    if (clean === 'конецинвент') {
+    if (isInventoryEnd) {
       await tgSend(botToken, chatId, 'Формирую лист «Расхождение» и отправляю картинку…');
+      logLine(`[inventory] TRIGGER inventoryDiffReport chatId=${chatId}`);
       runMjsAsync(logLine, INVENTORY_DIFF_REPORT_MJS, INVENTORY_DIFF_LOG, [`--chatId=${chatId}`]);
       return;
     }
