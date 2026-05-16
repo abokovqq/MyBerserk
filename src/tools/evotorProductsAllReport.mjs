@@ -15,6 +15,12 @@ const COLOR_RED    = '#FFE1E1';
 const COLOR_YELLOW = '#FFF3D6';
 const COLOR_GREEN  = '#DFF6E8';
 
+const LOG_DIR  = '/home/a/abokovsa/berserkclub.ru/MyBerserk/logs';
+const LOG_PATH = `${LOG_DIR}/evotorProductsAllReport.log`;
+
+const TG_SEND_RETRIES = 5;
+const TG_SEND_TIMEOUT_MS = 60_000;
+
 /* ==================================================== */
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -29,21 +35,143 @@ function envNum(name) {
 
 const DEFAULT_CHAT_ID = envNum('TG_CHAT_MAIN');
 
+/* ======================= TIME / LOG ======================= */
+
+function nowMoscow() {
+  const d = new Date();
+
+  const base = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Europe/Moscow',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(d).replace(' ', 'T');
+
+  return `${base}.${String(d.getMilliseconds()).padStart(3, '0')}+03:00`;
+}
+
+async function appendLog(text) {
+  try {
+    await fs.promises.mkdir(LOG_DIR, { recursive: true });
+    await fs.promises.appendFile(LOG_PATH, `${text}\n`);
+  } catch {}
+}
+
+function errorToLog(err) {
+  const cause = err?.cause;
+
+  return [
+    `${err?.name || 'Error'}: ${err?.message || String(err)}`,
+
+    cause
+      ? [
+          'cause:',
+          `name=${cause.name || ''}`,
+          `code=${cause.code || ''}`,
+          `errno=${cause.errno || ''}`,
+          `syscall=${cause.syscall || ''}`,
+          `hostname=${cause.hostname || ''}`,
+          `address=${cause.address || ''}`,
+          `port=${cause.port || ''}`,
+          `message=${cause.message || ''}`,
+        ].join(' ')
+      : '',
+
+    err?.stack || '',
+  ].filter(Boolean).join('\n');
+}
+
+async function logErrorBlock(title, err) {
+  const text = `[${nowMoscow()}] ${title}\n${errorToLog(err)}\n`;
+
+  console.error(text);
+  await appendLog(text);
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 /* ======================= TG PHOTO ======================= */
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = TG_SEND_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function sendPhoto({ chatId, filePath }) {
   if (!BOT_TOKEN) throw new Error('TELEGRAM_BOT_TOKEN не задан');
 
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
   const buffer = await fs.promises.readFile(filePath);
-  const blob = new Blob([buffer]);
 
-  const form = new FormData();
-  form.append('chat_id', String(chatId));
-  form.append('photo', blob, 'evotor_products.png');
+  let lastErr = null;
 
-  const res = await fetch(url, { method: 'POST', body: form });
-  if (!res.ok) throw new Error(await res.text());
+  for (let attempt = 1; attempt <= TG_SEND_RETRIES; attempt++) {
+    try {
+      const blob = new Blob([buffer], { type: 'image/png' });
+
+      const form = new FormData();
+      form.append('chat_id', String(chatId));
+      form.append('photo', blob, 'evotor_products.png');
+
+      const startText =
+        `[${nowMoscow()}] sendPhoto: attempt=${attempt}/${TG_SEND_RETRIES}, ` +
+        `file=${filePath}, size=${buffer.length}`;
+
+      console.log(startText);
+      await appendLog(startText);
+
+      const res = await fetchWithTimeout(url, {
+        method: 'POST',
+        body: form,
+      });
+
+      const text = await res.text();
+
+      if (!res.ok) {
+        throw new Error(`Telegram sendPhoto failed: HTTP ${res.status} ${text}`);
+      }
+
+      const okText = `[${nowMoscow()}] sendPhoto: OK attempt=${attempt}`;
+      console.log(okText);
+      await appendLog(okText);
+
+      return JSON.parse(text);
+    } catch (err) {
+      lastErr = err;
+
+      await logErrorBlock(
+        `sendPhoto failed: attempt=${attempt}/${TG_SEND_RETRIES}`,
+        err
+      );
+
+      if (attempt < TG_SEND_RETRIES) {
+        const delayMs = 3000 * attempt;
+        const retryText = `[${nowMoscow()}] sendPhoto: retry after ${delayMs}ms`;
+
+        console.log(retryText);
+        await appendLog(retryText);
+
+        await sleep(delayMs);
+      }
+    }
+  }
+
+  throw lastErr;
 }
 
 /* ======================= CLI ======================= */
@@ -72,7 +200,9 @@ function wrapName(txt, maxLen = 32) {
     out.push(s.slice(0, cut));
     s = s.slice(cut).trimStart();
   }
+
   if (s.length) out.push(s);
+
   return out.length ? out : [''];
 }
 
@@ -150,8 +280,6 @@ async function renderAndSendGroup(groupName) {
 
   if (!rows.length) return;
 
-  // ⬇️ ГЛАВНОЕ ИЗМЕНЕНИЕ:
-  // название группы → заголовок таблицы
   const table = [[groupName.toUpperCase(), 'ОСТАТОК']];
   const rowBgColors = [];
 
@@ -160,19 +288,23 @@ async function renderAndSendGroup(groupName) {
       wrapName(r.product_name).join('\n'),
       intStr(r.stock),
     ]);
+
     rowBgColors.push(stockToColor(r.stock, groupName));
   }
 
   const outPath = `/tmp/evotor_products_${groupName}.png`;
 
-  await renderTableToPngColorRows(table, {
-    outPath,
-    colMinWidths: [COL_WIDTH_NAME, COL_WIDTH_STOCK],
-    rowBgColors,
-  });
+  try {
+    await renderTableToPngColorRows(table, {
+      outPath,
+      colMinWidths: [COL_WIDTH_NAME, COL_WIDTH_STOCK],
+      rowBgColors,
+    });
 
-  await sendPhoto({ chatId, filePath: outPath });
-  await fs.promises.unlink(outPath).catch(() => {});
+    await sendPhoto({ chatId, filePath: outPath });
+  } finally {
+    await fs.promises.unlink(outPath).catch(() => {});
+  }
 }
 
 /* ======================= MAIN ======================= */
@@ -181,26 +313,34 @@ async function main() {
   try {
     if (!chatId) return;
 
+    const startText = `[${nowMoscow()}] evotorProductsAllReport: start`;
+    console.log(startText);
+    await appendLog(startText);
+
     for (const g of GROUPS) {
+      const groupText = `[${nowMoscow()}] evotorProductsAllReport: group=${g}`;
+      console.log(groupText);
+      await appendLog(groupText);
+
       await renderAndSendGroup(g);
     }
+
+    const finishText = `[${nowMoscow()}] evotorProductsAllReport: finish`;
+    console.log(finishText);
+    await appendLog(finishText);
   } catch (e) {
-    const errText = String(e?.stack || e?.message || e);
+    const errText = errorToLog(e);
 
     console.error('evotorProductsAllReport error:', errText);
 
-    try {
-      await fs.promises.mkdir('/home/a/abokovsa/berserkclub.ru/MyBerserk/logs', { recursive: true });
-      await fs.promises.appendFile(
-        '/home/a/abokovsa/berserkclub.ru/MyBerserk/logs/evotorProductsAllReport.log',
-        `[${new Date().toISOString()}] ERROR\n${errText}\n\n`
-      );
-    } catch {}
+    await appendLog(
+      `[${nowMoscow()}] ERROR\n${errText}\n`
+    );
 
     try {
       await send(
         chatId,
-        `❗ Ошибка при формировании отчёта по товарам.\n\n${errText.slice(0, 3000)}`
+        `❗ Ошибка при формировании отчёта по товарам`
       );
     } catch {}
   }

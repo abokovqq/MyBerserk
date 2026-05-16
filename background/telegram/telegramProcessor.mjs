@@ -34,6 +34,10 @@ const INVENTORY_DIFF_LOG = '/home/a/abokovsa/berserkclub.ru/logs/inventoryDiffRe
 const WEEKLY_SCHEDULE_POST_MJS = `${PROJECT_ROOT}/src/workers/weeklySchedulePost.mjs`;
 const WEEKLY_SCHEDULE_POST_LOG = '/home/a/abokovsa/berserkclub.ru/logs/weeklySchedulePost.log';
 
+const TELEGRAM_QUEUE_TABLE = 'telegram_updates_queue';
+const SCHEDULE_MAX_ATTEMPTS = 3;
+const SCHEDULE_RUN_TIMEOUT_MS = 180000;
+
 function envNum(name) {
   const raw = process.env[name];
   if (raw == null) return null;
@@ -56,6 +60,12 @@ function escapeHtml(value) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#039;');
+}
+
+function formatReceivedAt(value) {
+  if (!value) return '-';
+  if (value instanceof Date) return value.toISOString();
+  return String(value);
 }
 
 function extractUpdateMeta(upd) {
@@ -195,6 +205,41 @@ function runMjsAsync(logLine, mjsPath, logPath, args = []) {
   logLine(`[mjs-async] ${cmd}`);
 
   exec(cmd, { shell: '/bin/bash' }, () => {});
+}
+
+function runMjsWait(logLine, mjsPath, logPath, args = [], extraEnv = {}) {
+  return new Promise((resolve, reject) => {
+    let cmd = `cd ${shellEscape(PROJECT_ROOT)} && ${shellEscape(NODE_BIN)} ${shellEscape(mjsPath)}`;
+
+    for (const arg of args) {
+      cmd += ` ${shellEscape(arg)}`;
+    }
+
+    cmd += ` >> ${shellEscape(logPath)} 2>&1`;
+
+    logLine(`[mjs-wait] ${cmd}`);
+
+    exec(
+      cmd,
+      {
+        shell: '/bin/bash',
+        env: {
+          ...process.env,
+          ...extraEnv,
+        },
+        timeout: SCHEDULE_RUN_TIMEOUT_MS,
+        maxBuffer: 1024 * 1024 * 20,
+      },
+      (error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        resolve(true);
+      }
+    );
+  });
 }
 
 function shellEscape(value) {
@@ -376,7 +421,51 @@ function formatCleaningPlace(placeRaw) {
   return String(placeRaw ?? '').trim().replace('PC1', '№');
 }
 
-async function handleScheduleNew(upd, botToken, logLine) {
+async function setScheduleAttempt(pool, rowId, attempt) {
+  await pool.execute(
+    `
+    UPDATE ${TELEGRAM_QUEUE_TABLE}
+       SET attempts = ?,
+           processing = 1,
+           error_text = NULL
+     WHERE id = ?
+     LIMIT 1
+    `,
+    [attempt, rowId]
+  );
+}
+
+async function markScheduleRetry(pool, rowId, errorText) {
+  await pool.execute(
+    `
+    UPDATE ${TELEGRAM_QUEUE_TABLE}
+       SET processed = 0,
+           processing = 0,
+           processed_at = NULL,
+           error_text = ?
+     WHERE id = ?
+     LIMIT 1
+    `,
+    [String(errorText || '').slice(0, 65000), rowId]
+  );
+}
+
+async function markScheduleNok(pool, rowId) {
+  await pool.execute(
+    `
+    UPDATE ${TELEGRAM_QUEUE_TABLE}
+       SET processed = 1,
+           processing = 0,
+           processed_at = NOW(),
+           error_text = 'NOK'
+     WHERE id = ?
+     LIMIT 1
+    `,
+    [rowId]
+  );
+}
+
+async function handleScheduleNew(upd, botToken, logLine, row = null, pool = null) {
   const scheduleChatId = envNum('TG_CHAT_SCHEDULE');
   if (!scheduleChatId) return false;
 
@@ -397,9 +486,22 @@ async function handleScheduleNew(upd, botToken, logLine) {
   }
 
   const chatId = String(msg?.chat?.id ?? '');
+  const messageId = msg?.message_id ?? null;
   const text = String(msg?.text ?? '').trim();
+  const receivedAt = formatReceivedAt(row?.received_at);
+  const queueId = row?.id ?? null;
+  const currentAttempts = Number(row?.attempts || 0);
 
-  logLine(`[schedule] msgType=${msgType} chatId=${chatId} needChatId=${scheduleChatId} text=${text.replace(/\r?\n/g, ' ')}`);
+  logLine(
+    `[schedule] msgType=${msgType}`
+    + ` queue_id=${queueId ?? '-'}`
+    + ` message_id=${messageId ?? 'null'}`
+    + ` received_at=${receivedAt}`
+    + ` attempts=${currentAttempts}`
+    + ` chatId=${chatId}`
+    + ` needChatId=${scheduleChatId}`
+    + ` text=${text.replace(/\r?\n/g, ' ')}`
+  );
 
   if (chatId !== String(scheduleChatId)) {
     logLine('[schedule] skip: chatId mismatch');
@@ -412,20 +514,100 @@ async function handleScheduleNew(upd, botToken, logLine) {
   }
 
   const t = text.toLowerCase();
-  const isNew = /^\/new$/iu.test(t) || /^@berserkgame7bot\s+new$/iu.test(t);
+  const isNew =
+    /^\/new(?:@[a-zA-Z0-9_]+)?$/iu.test(t) ||
+    /^@berserkgame7bot\s+new$/iu.test(t) ||
+    /^@berserkbot7\s+new$/iu.test(t);
 
   if (!isNew) {
     logLine(`[schedule] skip: not allowed command: ${text}`);
     return false;
   }
 
-  logLine(`[schedule] TRIGGER OK: ${text}`);
+  if (!queueId || !pool) {
+    throw new Error('[schedule] queue row/pool missing');
+  }
 
-  const resp = await tgSend(botToken, chatId, 'Ок, обновляю расписание…');
-  logLine(`[schedule] sendMessage ok=${resp?.ok ? '1' : '0'}`);
+  if (currentAttempts >= SCHEDULE_MAX_ATTEMPTS) {
+    logLine(
+      `[schedule] max attempts already reached`
+      + ` queue_id=${queueId}`
+      + ` message_id=${messageId ?? 'null'}`
+      + ` received_at=${receivedAt}`
+      + ` attempts=${currentAttempts}`
+    );
 
-  runMjsAsync(logLine, WEEKLY_SCHEDULE_POST_MJS, WEEKLY_SCHEDULE_POST_LOG);
-  return true;
+    await markScheduleNok(pool, queueId);
+    return { skipWorkerMark: true };
+  }
+
+  const attempt = currentAttempts + 1;
+  await setScheduleAttempt(pool, queueId, attempt);
+  row.attempts = attempt;
+
+  logLine(
+    `[schedule] TRIGGER OK: ${text}`
+    + ` queue_id=${queueId}`
+    + ` message_id=${messageId ?? 'null'}`
+    + ` received_at=${receivedAt}`
+    + ` attempt=${attempt}/${SCHEDULE_MAX_ATTEMPTS}`
+  );
+
+  try {
+    await runMjsWait(
+      logLine,
+      WEEKLY_SCHEDULE_POST_MJS,
+      WEEKLY_SCHEDULE_POST_LOG,
+      [],
+      {
+        TG_QUEUE_ID: String(queueId),
+        TG_MESSAGE_ID: String(messageId ?? ''),
+        TG_RECEIVED_AT: receivedAt,
+        TG_ATTEMPT: String(attempt),
+      }
+    );
+
+    logLine(
+      `[schedule] DONE OK`
+      + ` queue_id=${queueId}`
+      + ` message_id=${messageId ?? 'null'}`
+      + ` received_at=${receivedAt}`
+      + ` attempt=${attempt}/${SCHEDULE_MAX_ATTEMPTS}`
+    );
+
+    return true;
+  } catch (err) {
+    const errText = String(err?.stack || err?.message || err);
+
+    logLine(
+      `[schedule] DONE ERROR`
+      + ` queue_id=${queueId}`
+      + ` message_id=${messageId ?? 'null'}`
+      + ` received_at=${receivedAt}`
+      + ` attempt=${attempt}/${SCHEDULE_MAX_ATTEMPTS}`
+      + ` err=${String(err?.message || err)}`
+    );
+
+    const resp = await tgSend(botToken, chatId, `ошибка составления расписания - попытка ${attempt}`);
+    logLine(`[schedule] error notice sendMessage ok=${resp?.ok ? '1' : '0'}`);
+
+    if (attempt >= SCHEDULE_MAX_ATTEMPTS) {
+      await markScheduleNok(pool, queueId);
+
+      logLine(
+        `[schedule] NOK max attempts reached`
+        + ` queue_id=${queueId}`
+        + ` message_id=${messageId ?? 'null'}`
+        + ` received_at=${receivedAt}`
+        + ` attempts=${attempt}`
+      );
+
+      return { skipWorkerMark: true };
+    }
+
+    await markScheduleRetry(pool, queueId, errText);
+    return { skipWorkerMark: true };
+  }
 }
 
 async function handleBonusCallback(pool, botToken, upd, meta, logLine) {
@@ -843,12 +1025,15 @@ export async function processTelegramUpdate({ row, pool, logLine }) {
     + ` kind=${meta.kind}`
     + ` chat_id=${meta.chat_id ?? 'null'}`
     + ` message_id=${meta.message_id ?? 'null'}`
+    + ` received_at=${formatReceivedAt(row.received_at)}`
+    + ` attempts=${row.attempts ?? 0}`
     + ` text=${meta.text_preview || '-'}`
     + ` cb=${meta.callback_data || '-'}`
   );
 
-  if (await handleScheduleNew(upd, botToken, logLine)) {
-    return;
+  const scheduleResult = await handleScheduleNew(upd, botToken, logLine, row, pool);
+  if (scheduleResult) {
+    return scheduleResult;
   }
 
   if (meta.kind === 'callback_query') {

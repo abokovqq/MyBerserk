@@ -74,7 +74,7 @@ async function claimNextUpdate(conn) {
   try {
     const [rows] = await conn.execute(
       `
-      SELECT id, payload, source, received_at
+      SELECT id, payload, source, received_at, attempts
       FROM ${TABLE_NAME}
       WHERE processed = 0
         AND processing = 0
@@ -183,18 +183,31 @@ async function main() {
       }
 
       const queueAgeMs = calcQueueAgeMs(row.received_at);
+
       logLine(
         `claimed id=${row.id}`
         + ` source=${row.source ?? '-'}`
+        + ` attempts=${row.attempts ?? 0}`
+        + ` received_at=${row.received_at ?? '-'}`
         + ` queue_age_ms=${queueAgeMs == null ? 'null' : queueAgeMs}`
       );
 
       try {
-        await processTelegramUpdate({
+        const result = await processTelegramUpdate({
           row,
           pool,
           logLine,
         });
+
+        if (result?.skipWorkerMark) {
+          logLine(
+            `processed delegated id=${row.id}`
+            + ` source=${row.source ?? '-'}`
+            + ` attempts=${row.attempts ?? 0}`
+            + ` queue_age_ms=${queueAgeMs == null ? 'null' : queueAgeMs}`
+          );
+          continue;
+        }
 
         const conn2 = await pool.getConnection();
         try {
