@@ -1,28 +1,37 @@
 // /home/a/abokovsa/berserkclub.ru/MyBerserk/src/workers/inventoryDiffReport.mjs
-// Формирование листа "Расхождение" + PNG + управление INVENT_CLEAR_ON_START
+// Формирование листа "Расхождение" + PNG + робустная отправка в Telegram + управление INVENT_CLEAR_ON_START
 
 import '../env.js';
 import { google } from 'googleapis';
 import fs from 'node:fs';
 import { createCanvas } from 'canvas';
 
+const PROJECT_ROOT = '/home/a/abokovsa/berserkclub.ru/MyBerserk';
+const ENV_FILE = `${PROJECT_ROOT}/.env`;
+const TMP_DIR = `${PROJECT_ROOT}/tmp`;
+const LOCK_FILE = `${TMP_DIR}/inventoryDiffReport.lock`;
+
 const TZ = process.env.TZ || 'Europe/Moscow';
 const SPREADSHEET_ID = process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
+
 const SRC_SHEET =
   (process.env.GOOGLE_SHEETS_SHEET_NAME ||
     process.env.GOOGLE_SHEETS_DATA_SHEET ||
     'Data').replace(/"/g, '');
+
 const DIFF_SHEET =
-  (process.env.GOOGLE_SHEETS_DIFF_SHEET_NAME || 'Расхождение').replace(
-    /"/g,
-    ''
-  );
+  (process.env.GOOGLE_SHEETS_DIFF_SHEET_NAME || 'Расхождение').replace(/"/g, '');
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const ENV_FILE = '/home/a/abokovsa/berserkclub.ru/MyBerserk/.env';
 
-// ----- аргументы CLI -----
+const GOOGLE_TIMEOUT_MS = 90000;
+const TELEGRAM_TIMEOUT_MS = 120000;
+const GOOGLE_ATTEMPTS = 4;
+const TELEGRAM_ATTEMPTS = 4;
+
+
 const argv = process.argv.slice(2);
+
 function getArg(name, def = null) {
   const pref = `--${name}=`;
   const found = argv.find(a => a.startsWith(pref));
@@ -32,7 +41,251 @@ function getArg(name, def = null) {
 
 const CHAT_ID = getArg('chatId', null);
 
-// ----- time helpers -----
+function stamp() {
+  return new Date().toLocaleString('ru-RU', {
+    timeZone: TZ,
+    hour12: false,
+  });
+}
+
+function log(...args) {
+  console.log(`[${stamp()}]`, ...args);
+}
+
+function errlog(...args) {
+  console.error(`[${stamp()}]`, ...args);
+}
+
+process.on('unhandledRejection', err => {
+  errlog('UNHANDLED_REJECTION:', err?.stack || err?.message || err);
+});
+
+process.on('uncaughtException', err => {
+  errlog('UNCAUGHT_EXCEPTION:', err?.stack || err?.message || err);
+  process.exit(1);
+});
+
+process.on('SIGHUP', () => {
+  errlog('SIGHUP received and ignored');
+});
+
+process.on('SIGTERM', () => {
+  errlog('SIGTERM received');
+  process.exit(143);
+});
+
+function ensureTmpDir() {
+  if (!fs.existsSync(TMP_DIR)) {
+    fs.mkdirSync(TMP_DIR, { recursive: true });
+  }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function round2(value) {
+  return Math.round(Number(value || 0) * 100) / 100;
+}
+
+function parseNumber(value) {
+  if (value == null || value === '') return 0;
+
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  const s = String(value)
+    .replace(/\s+/g, '')
+    .replace(',', '.')
+    .trim();
+
+  const n = Number(s);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function quoteSheetName(name) {
+  return `'${String(name).replace(/'/g, "''")}'`;
+}
+
+function shortRaw(raw, limit = 1000) {
+  return String(raw ?? '').substring(0, limit);
+}
+
+function isRetryableHttpStatus(status) {
+  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+function isRetryableError(err) {
+  const msg = String(err?.message || err || '').toLowerCase();
+
+  return (
+    err?.name === 'AbortError' ||
+    msg.includes('fetch failed') ||
+    msg.includes('timeout') ||
+    msg.includes('socket') ||
+    msg.includes('econnreset') ||
+    msg.includes('etimedout') ||
+    msg.includes('eai_again') ||
+    msg.includes('network')
+  );
+}
+
+async function fetchTextRetry(label, attempts, timeoutMs, makeOptions) {
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      log(`${label}: attempt ${attempt}/${attempts}`);
+
+      const options = await makeOptions();
+      const res = await fetch(options.url, {
+        method: options.method || 'GET',
+        headers: options.headers,
+        body: options.body,
+        signal: controller.signal,
+      });
+
+      const raw = await res.text();
+
+      if (!res.ok) {
+        const e = new Error(`${label}: HTTP ${res.status}, body=${shortRaw(raw)}`);
+        e.httpStatus = res.status;
+        e.raw = raw;
+
+        if (attempt < attempts && isRetryableHttpStatus(res.status)) {
+          lastErr = e;
+          errlog(`${label}: retryable HTTP error on attempt ${attempt}:`, e.message);
+          await sleep(1500 * attempt);
+          continue;
+        }
+
+        throw e;
+      }
+
+      return raw;
+    } catch (e) {
+      lastErr = e;
+
+      if (attempt < attempts && isRetryableError(e)) {
+        errlog(`${label}: retryable error on attempt ${attempt}:`, e?.message || e);
+        await sleep(1500 * attempt);
+        continue;
+      }
+
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  throw lastErr || new Error(`${label}: failed`);
+}
+
+async function fetchJsonRetry(label, attempts, timeoutMs, makeOptions) {
+  const raw = await fetchTextRetry(label, attempts, timeoutMs, makeOptions);
+
+  try {
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    throw new Error(`${label}: bad json, body=${shortRaw(raw)}`);
+  }
+}
+
+function parseLock(raw) {
+  const s = String(raw ?? '').trim();
+
+  if (!s) {
+    return {
+      pid: null,
+      startedAtMs: null,
+      raw: '',
+    };
+  }
+
+  try {
+    const json = JSON.parse(s);
+    const pid = Number.parseInt(json?.pid, 10);
+    const startedAtMs = json?.startedAt ? Date.parse(json.startedAt) : null;
+
+    return {
+      pid: pid > 0 ? pid : null,
+      startedAtMs: Number.isFinite(startedAtMs) ? startedAtMs : null,
+      raw: s,
+    };
+  } catch {
+    const pid = Number.parseInt(s, 10);
+
+    return {
+      pid: pid > 0 ? pid : null,
+      startedAtMs: null,
+      raw: s,
+    };
+  }
+}
+
+function isPidAlive(pid) {
+  if (!(pid > 0)) return false;
+
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function acquireLock() {
+  ensureTmpDir();
+
+  if (fs.existsSync(LOCK_FILE)) {
+    const raw = fs.readFileSync(LOCK_FILE, 'utf8');
+    const lock = parseLock(raw);
+
+    if (lock.pid && isPidAlive(lock.pid)) {
+      const e = new Error(`inventoryDiffReport already running, pid=${lock.pid}`);
+      e.code = 'ALREADY_RUNNING';
+      throw e;
+    }
+
+    log(`stale lock removed: ${LOCK_FILE}, oldPid=${lock.raw || raw.trim() || '-'}`);
+    fs.unlinkSync(LOCK_FILE);
+  }
+
+  fs.writeFileSync(
+    LOCK_FILE,
+    JSON.stringify(
+      {
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+      },
+      null,
+      2
+    )
+  );
+
+  log(`lock acquired: ${LOCK_FILE}, pid=${process.pid}`);
+}
+
+function releaseLock() {
+  try {
+    if (!fs.existsSync(LOCK_FILE)) return;
+
+    const raw = fs.readFileSync(LOCK_FILE, 'utf8');
+    const lock = parseLock(raw);
+
+    if (lock.pid === process.pid) {
+      fs.unlinkSync(LOCK_FILE);
+      log(`lock released: ${LOCK_FILE}`);
+    }
+  } catch (e) {
+    errlog('releaseLock: failed', e);
+  }
+}
+
 function nowTZ() {
   return new Date(
     new Date().toLocaleString('en-US', {
@@ -40,100 +293,68 @@ function nowTZ() {
     })
   );
 }
+
 function formatDate(d) {
   const dd = String(d.getDate()).padStart(2, '0');
   const mm = String(d.getMonth() + 1).padStart(2, '0');
   const yyyy = d.getFullYear();
+
   return `${dd}.${mm}.${yyyy}`;
 }
 
-// ----- работа с .env: установка INVENT_CLEAR_ON_START -----
 function setInventClearOnStart(value) {
   const KEY = 'INVENT_CLEAR_ON_START';
   const vStr = String(value);
 
   try {
     if (!fs.existsSync(ENV_FILE)) {
-      console.log('setInventClearOnStart: .env not found:', ENV_FILE);
-      return;
+      log('setInventClearOnStart: .env not found:', ENV_FILE);
+      return false;
     }
+
     const orig = fs.readFileSync(ENV_FILE, 'utf8');
     const lines = orig.split(/\r?\n/);
+
     let changed = false;
 
     const updated = lines.map(line => {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith(KEY + '=')) return line;
+      const match = line.match(/^(\s*INVENT_CLEAR_ON_START\s*=\s*)([^#\r\n]*)(.*)$/);
 
-      const hashPos = line.indexOf('#');
-      let comment = '';
-      if (hashPos !== -1) {
-        comment = line.substring(hashPos);
+      if (!match) {
+        return line;
       }
+
       changed = true;
-      return KEY + '=' + vStr + (comment ? ' ' + comment : '');
+
+      const prefix = match[1];
+      const tail = match[3] || '';
+
+      return `${prefix}${vStr}${tail}`;
     });
 
     if (!changed) {
-      console.log('setInventClearOnStart: key not found, nothing to change');
-      return;
+      updated.push(`${KEY}=${vStr}`);
+      log('setInventClearOnStart: key not found, added');
     }
 
     fs.writeFileSync(ENV_FILE, updated.join('\n'));
-    console.log(`setInventClearOnStart: ${KEY} set to ${vStr} in .env`);
+
+    log(`setInventClearOnStart: ${KEY} set to ${vStr} in .env`);
+    return true;
   } catch (e) {
-    console.error('setInventClearOnStart: failed to update .env', e);
+    errlog('setInventClearOnStart: failed to update .env', e);
+    return false;
   }
 }
 
-// ----- sendPhoto (локально) -----
-async function sendPhoto(chatId, filePath, caption = '') {
-  if (!TELEGRAM_TOKEN) {
-    console.error('sendPhoto: TELEGRAM_BOT_TOKEN не задан в .env');
-    return;
-  }
-  if (!chatId) {
-    console.error('sendPhoto: chatId пустой');
-    return;
-  }
-
-  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendPhoto`;
-
-  const fileData = await fs.promises.readFile(filePath);
-  const formData = new FormData();
-  formData.append('chat_id', String(chatId));
-  if (caption) formData.append('caption', caption);
-  formData.append('photo', new Blob([fileData]), 'inventory_diff.png');
-
-  const res = await fetch(url, {
-    method: 'POST',
-    body: formData,
-  });
-
-  let json;
-  try {
-    json = await res.json();
-  } catch (e) {
-    console.error('sendPhoto: не удалось распарсить ответ Telegram', e);
-    return;
-  }
-
-  if (!json.ok) {
-    console.error('sendPhoto: ошибка Telegram', json);
-  } else {
-    console.log('sendPhoto: отправлено успешно, message_id=', json.result?.message_id);
-  }
-}
-
-// ----- Google Sheets client -----
-async function getSheetsClient() {
+async function getGoogleAuthClient() {
   const clientEmail = process.env.GOOGLE_SHEETS_CLIENT_EMAIL;
   const rawKey = process.env.GOOGLE_SHEETS_PRIVATE_KEY;
 
+  log('getGoogleAuthClient: start');
+
   if (!clientEmail || !rawKey) {
-    throw new Error(
-      'Нет GOOGLE_SHEETS_CLIENT_EMAIL или GOOGLE_SHEETS_PRIVATE_KEY в .env'
-    );
+    throw new Error('Нет GOOGLE_SHEETS_CLIENT_EMAIL или GOOGLE_SHEETS_PRIVATE_KEY в .env');
   }
 
   const privateKey = rawKey.replace(/\\n/g, '\n');
@@ -146,71 +367,147 @@ async function getSheetsClient() {
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
 
-  await auth.getClient();
-  console.log('GoogleAuth client for diff report obtained OK');
+  let lastErr = null;
 
-  return google.sheets({ version: 'v4', auth });
-}
+  for (let attempt = 1; attempt <= GOOGLE_ATTEMPTS; attempt++) {
+    try {
+      log(`getGoogleAuthClient: auth.getClient attempt ${attempt}/${GOOGLE_ATTEMPTS}`);
 
-// ----- sheetId по имени -----
-async function getSheetId(sheets, title) {
-  const meta = await sheets.spreadsheets.get({
-    spreadsheetId: SPREADSHEET_ID,
-  });
+      const authClient = await Promise.race([
+        auth.getClient(),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error(`GoogleAuth getClient timeout ${GOOGLE_TIMEOUT_MS}ms`)), GOOGLE_TIMEOUT_MS);
+        }),
+      ]);
 
-  const sheet = (meta.data.sheets || []).find(
-    s => s.properties && s.properties.title === title
-  );
+      log('GoogleAuth client for diff report obtained OK');
 
-  if (!sheet || !sheet.properties || sheet.properties.sheetId == null) {
-    throw new Error(`Не найден лист "${title}" в таблице`);
+      return authClient;
+    } catch (e) {
+      lastErr = e;
+      errlog('getGoogleAuthClient: error:', e?.message || e);
+
+      if (attempt < GOOGLE_ATTEMPTS) {
+        await sleep(1500 * attempt);
+      }
+    }
   }
 
-  return sheet.properties.sheetId;
+  throw lastErr || new Error('GoogleAuth getClient failed');
 }
 
-// ----- очистка листа Расхождение с 3-й строки -----
-async function clearDiffSheetFromRow3(sheets) {
-  const sheetId = await getSheetId(sheets, DIFF_SHEET);
+async function getAccessToken(authClient) {
+  let lastErr = null;
 
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId: SPREADSHEET_ID,
-    requestBody: {
-      requests: [
-        {
-          repeatCell: {
-            range: {
-              sheetId,
-              startRowIndex: 2,
-              startColumnIndex: 0,
-            },
-            cell: {},
-            fields: 'userEnteredValue,userEnteredFormat',
-          },
-        },
-      ],
+  for (let attempt = 1; attempt <= GOOGLE_ATTEMPTS; attempt++) {
+    try {
+      log(`getAccessToken: attempt ${attempt}/${GOOGLE_ATTEMPTS}`);
+
+      const tokenResp = await Promise.race([
+        authClient.getAccessToken(),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error(`GoogleAuth getAccessToken timeout ${GOOGLE_TIMEOUT_MS}ms`)), GOOGLE_TIMEOUT_MS);
+        }),
+      ]);
+
+      const token =
+        typeof tokenResp === 'string'
+          ? tokenResp
+          : tokenResp?.token;
+
+      if (!token) {
+        throw new Error('Не удалось получить Google access token');
+      }
+
+      return token;
+    } catch (e) {
+      lastErr = e;
+      errlog('getAccessToken: error:', e?.message || e);
+
+      if (attempt < GOOGLE_ATTEMPTS) {
+        await sleep(1500 * attempt);
+      }
+    }
+  }
+
+  throw lastErr || new Error('getAccessToken failed');
+}
+
+async function googleFetchJson(authClient, label, method, url, bodyObj = null) {
+  const token = await getAccessToken(authClient);
+
+  return fetchJsonRetry(label, GOOGLE_ATTEMPTS, GOOGLE_TIMEOUT_MS, async () => ({
+    url,
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json; charset=utf-8',
     },
-  });
-
-  console.log(
-    `Diff sheet "${DIFF_SHEET}": очищены значения и форматирование с 3-й строки и ниже`
-  );
+    body: bodyObj == null ? undefined : JSON.stringify(bodyObj),
+  }));
 }
 
-// ----- читаем Data и берём только строки с расхождением -----
-async function loadDataSheet(sheets) {
-  const range = `${SRC_SHEET}!A1:F10000`;
+async function getActualSheetTitle(authClient, requestedTitle) {
+  const url =
+    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(SPREADSHEET_ID)}`
+    + `?fields=sheets(properties(title))`;
 
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range,
-    valueRenderOption: 'UNFORMATTED_VALUE',
-  });
+  const json = await googleFetchJson(
+    authClient,
+    `Google Sheets metadata ${requestedTitle}`,
+    'GET',
+    url
+  );
 
-  const rows = res.data.values || [];
+  const sheetsList = json?.sheets || [];
+
+  let found = sheetsList.find(s => s?.properties?.title === requestedTitle);
+
+  if (!found) {
+    found = sheetsList.find(
+      s => String(s?.properties?.title || '').toLowerCase() === String(requestedTitle).toLowerCase()
+    );
+
+    if (found) {
+      log(`getActualSheetTitle: лист "${requestedTitle}" найден как "${found.properties.title}" без учёта регистра`);
+    }
+  }
+
+  if (!found) {
+    const titles = sheetsList
+      .map(s => s?.properties?.title)
+      .filter(Boolean)
+      .join(', ');
+
+    throw new Error(`Лист "${requestedTitle}" не найден. Доступные листы: ${titles}`);
+  }
+
+  return found.properties.title;
+}
+
+async function loadDataSheet(authClient, actualSrcSheet) {
+  const range = `${quoteSheetName(actualSrcSheet)}!A1:F10000`;
+  const encodedRange = encodeURIComponent(range);
+
+  const url =
+    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(SPREADSHEET_ID)}`
+    + `/values/${encodedRange}?valueRenderOption=UNFORMATTED_VALUE&majorDimension=ROWS`;
+
+  log(`loadDataSheet: читаю диапазон ${range}...`);
+
+  const json = await googleFetchJson(
+    authClient,
+    `Google Sheets values.get ${range}`,
+    'GET',
+    url
+  );
+
+  const rows = json?.values || [];
+
+  log(`loadDataSheet: получено строк = ${rows.length}`);
 
   if (rows.length <= 1) {
-    console.log('Data sheet: no data (only header or empty)');
+    log('Data sheet: no data');
     return [];
   }
 
@@ -220,24 +517,227 @@ async function loadDataSheet(sheets) {
   for (const row of dataRows) {
     const group = row[0] || '';
     const name = row[1] || '';
-    const evotor = Number(row[2] ?? 0);
-    const invent = Number(row[3] ?? 0);
-    const price = Number(row[5] ?? 0);
+    const evotor = parseNumber(row[2]);
+    const invent = parseNumber(row[3]);
+    const price = parseNumber(row[5]);
 
     if (!group && !name && !evotor && !invent && !price) continue;
 
-    const diff = invent - evotor;
+    const diff = round2(invent - evotor);
+
     if (diff !== 0) {
-      items.push({ group, name, evotor, invent, diff, price });
+      items.push({
+        group,
+        name,
+        evotor,
+        invent,
+        diff,
+        price,
+        sum: round2(diff * price),
+      });
     }
   }
 
-  console.log('Diff items count =', items.length);
+  log('Diff items count =', items.length);
+
   return items;
 }
 
-// ----- рендер PNG -----
+async function googleSheetsValuesUpdateRaw(authClient, range, values) {
+  const encodedRange = encodeURIComponent(range);
+
+  const url =
+    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(SPREADSHEET_ID)}`
+    + `/values/${encodedRange}?valueInputOption=RAW`;
+
+  const json = await googleFetchJson(
+    authClient,
+    `Google Sheets values.update ${range}`,
+    'PUT',
+    url,
+    { values }
+  );
+
+  log(
+    'googleSheetsValuesUpdateRaw: OK',
+    `updatedRange=${json?.updatedRange || '-'}`,
+    `updatedRows=${json?.updatedRows ?? '-'}`,
+    `updatedCells=${json?.updatedCells ?? '-'}`
+  );
+
+  return json;
+}
+
+async function sendMessage(chatId, text) {
+  if (!TELEGRAM_TOKEN) {
+    errlog('sendMessage: TELEGRAM_BOT_TOKEN не задан в .env');
+    return false;
+  }
+
+  if (!chatId) {
+    errlog('sendMessage: chatId пустой');
+    return false;
+  }
+
+  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+
+  try {
+    const raw = await fetchTextRetry(
+      'Telegram sendMessage',
+      TELEGRAM_ATTEMPTS,
+      TELEGRAM_TIMEOUT_MS,
+      async () => {
+        const body = new URLSearchParams();
+        body.append('chat_id', String(chatId));
+        body.append('text', text);
+
+        return {
+          url,
+          method: 'POST',
+          body,
+        };
+      }
+    );
+
+    let json = null;
+
+    try {
+      json = JSON.parse(raw);
+    } catch {
+      errlog('sendMessage: bad json response:', shortRaw(raw));
+      return false;
+    }
+
+    if (!json.ok) {
+      errlog('sendMessage: Telegram error:', JSON.stringify(json).substring(0, 1000));
+      return false;
+    }
+
+    log('sendMessage: отправлено, message_id=', json.result?.message_id);
+    return true;
+  } catch (e) {
+    errlog('sendMessage: failed:', e?.message || e);
+    return false;
+  }
+}
+
+async function sendTelegramFile({ method, fieldName, chatId, filePath, filename, caption }) {
+  if (!TELEGRAM_TOKEN) {
+    errlog(`${method}: TELEGRAM_BOT_TOKEN не задан в .env`);
+    return false;
+  }
+
+  if (!chatId) {
+    errlog(`${method}: chatId пустой`);
+    return false;
+  }
+
+  if (!fs.existsSync(filePath)) {
+    errlog(`${method}: file not found:`, filePath);
+    return false;
+  }
+
+  const stat = fs.statSync(filePath);
+  log(`${method}: file=${filePath}, size=${stat.size} bytes`);
+
+  if (stat.size <= 0) {
+    errlog(`${method}: file is empty`);
+    return false;
+  }
+
+  const fileData = await fs.promises.readFile(filePath);
+  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`;
+
+  try {
+    const raw = await fetchTextRetry(
+      `Telegram ${method}`,
+      TELEGRAM_ATTEMPTS,
+      TELEGRAM_TIMEOUT_MS,
+      async () => {
+        const formData = new FormData();
+
+        formData.append('chat_id', String(chatId));
+
+        if (caption) {
+          formData.append('caption', String(caption).substring(0, 1024));
+        }
+
+        formData.append(
+          fieldName,
+          new Blob([fileData], { type: 'image/png' }),
+          filename
+        );
+
+        return {
+          url,
+          method: 'POST',
+          body: formData,
+        };
+      }
+    );
+
+    let json = null;
+
+    try {
+      json = JSON.parse(raw);
+    } catch {
+      errlog(`${method}: bad json response:`, shortRaw(raw));
+      return false;
+    }
+
+    if (!json.ok) {
+      errlog(`${method}: Telegram error:`, JSON.stringify(json).substring(0, 1000));
+      return false;
+    }
+
+    log(`${method}: отправлено успешно, message_id=`, json.result?.message_id);
+    return true;
+  } catch (e) {
+    errlog(`${method}: failed:`, e?.message || e);
+    return false;
+  }
+}
+
+async function sendPhotoRobust(chatId, filePath, caption = '') {
+  log('sendPhotoRobust: start');
+
+  const photoSent = await sendTelegramFile({
+    method: 'sendPhoto',
+    fieldName: 'photo',
+    chatId,
+    filePath,
+    filename: 'inventory_diff.png',
+    caption,
+  });
+
+  if (photoSent) {
+    log('sendPhotoRobust: sendPhoto OK');
+    return true;
+  }
+
+  errlog('sendPhotoRobust: sendPhoto failed, trying sendDocument fallback');
+
+  const documentSent = await sendTelegramFile({
+    method: 'sendDocument',
+    fieldName: 'document',
+    chatId,
+    filePath,
+    filename: 'inventory_diff.png',
+    caption: `${caption}\nPNG отправлен как файл после ошибки sendPhoto.`,
+  });
+
+  if (documentSent) {
+    log('sendPhotoRobust: sendDocument fallback OK');
+    return true;
+  }
+
+  errlog('sendPhotoRobust: all Telegram file sending methods failed');
+  return false;
+}
+
 async function renderDiffPng(title, items, totalSum, totalSum20, quarter, outPath) {
+  log(`renderDiffPng: start, items=${items.length}, outPath=${outPath}`);
+
   const rows = [];
 
   rows.push([title, '', '', '', '', '', '', '']);
@@ -253,7 +753,6 @@ async function renderDiffPng(title, items, totalSum, totalSum20, quarter, outPat
   ]);
 
   for (const it of items) {
-    const sum = it.diff * it.price;
     rows.push([
       it.group,
       it.name,
@@ -261,32 +760,24 @@ async function renderDiffPng(title, items, totalSum, totalSum20, quarter, outPat
       String(it.invent),
       String(it.diff),
       String(it.price),
-      String(sum),
+      String(it.sum),
       '',
     ]);
   }
 
   rows.push(['', '', '', '', '', '', '', '']);
   rows.push(['', '', '', '', '', 'Сумма', String(totalSum), '']);
-  rows.push([
-    '',
-    '',
-    '',
-    '',
-    '',
-    'Сумма - 20%',
-    String(totalSum20),
-    String(quarter),
-  ]);
+  rows.push(['', '', '', '', '', 'Сумма - 20%', String(totalSum20), String(quarter)]);
 
   const colWidths = [130, 260, 70, 70, 80, 80, 100, 80];
   const leftPadding = 20;
   const topPadding = 20;
   const rowHeight = 28;
 
-  const totalWidth =
-    leftPadding * 2 + colWidths.reduce((a, b) => a + b, 0);
+  const totalWidth = leftPadding * 2 + colWidths.reduce((a, b) => a + b, 0);
   const totalHeight = topPadding * 2 + rows.length * rowHeight + 10;
+
+  log(`renderDiffPng: canvas ${totalWidth}x${totalHeight}`);
 
   const canvas = createCanvas(totalWidth, totalHeight);
   const ctx = canvas.getContext('2d');
@@ -303,12 +794,16 @@ async function renderDiffPng(title, items, totalSum, totalSum20, quarter, outPat
     const row = rows[r];
     const isTitleRow = r === 0;
     const isHeaderRow = r === 1;
+    const isTotalRow = r >= rows.length - 2;
 
     if (isTitleRow) {
       ctx.fillStyle = '#e0e0e0';
       ctx.fillRect(leftPadding, y, totalWidth - leftPadding * 2, rowHeight);
     } else if (isHeaderRow) {
       ctx.fillStyle = '#f5f5f5';
+      ctx.fillRect(leftPadding, y, totalWidth - leftPadding * 2, rowHeight);
+    } else if (isTotalRow) {
+      ctx.fillStyle = '#fafafa';
       ctx.fillRect(leftPadding, y, totalWidth - leftPadding * 2, rowHeight);
     }
 
@@ -331,11 +826,18 @@ async function renderDiffPng(title, items, totalSum, totalSum20, quarter, outPat
         const colWidth = colWidths[c];
 
         let tx = x;
+
         if (isNumericCol) {
           tx = x + colWidth - textWidth - 6;
         }
 
-        ctx.fillText(cell, tx, y + rowHeight / 2);
+        if (isHeaderRow || isTotalRow) {
+          ctx.font = 'bold 14px sans-serif';
+          ctx.fillText(cell, tx, y + rowHeight / 2);
+          ctx.font = '14px sans-serif';
+        } else {
+          ctx.fillText(cell, tx, y + rowHeight / 2);
+        }
       }
 
       x += colWidths[c];
@@ -352,44 +854,60 @@ async function renderDiffPng(title, items, totalSum, totalSum20, quarter, outPat
 
   let vx = leftPadding;
   ctx.strokeStyle = '#cccccc';
+
   for (let c = 0; c <= colWidths.length; c++) {
     ctx.beginPath();
     ctx.moveTo(vx, topPadding);
     ctx.lineTo(vx, y);
     ctx.stroke();
+
     if (c < colWidths.length) vx += colWidths[c];
   }
 
   await new Promise((resolve, reject) => {
     const out = fs.createWriteStream(outPath);
     const stream = canvas.createPNGStream();
+
     stream.pipe(out);
+
     out.on('finish', resolve);
     out.on('error', reject);
+    stream.on('error', reject);
   });
 
-  console.log('Diff PNG saved to', outPath);
+  const stat = fs.statSync(outPath);
+
+  log(`Diff PNG saved to ${outPath}, size=${stat.size} bytes`);
 }
 
-// ----- формирование листа Расхождение + PNG + флаг -----
 async function buildDiffSheet() {
+  log('inventoryDiffReport: start');
+  log('inventoryDiffReport: SRC_SHEET =', SRC_SHEET);
+  log('inventoryDiffReport: DIFF_SHEET =', DIFF_SHEET);
+  log('inventoryDiffReport: CHAT_ID =', CHAT_ID || '<empty>');
+
   if (!SPREADSHEET_ID) {
     throw new Error('Нет GOOGLE_SHEETS_SPREADSHEET_ID в .env');
   }
 
-  const sheets = await getSheetsClient();
-  const items = await loadDataSheet(sheets);
+  ensureTmpDir();
+
+  const authClient = await getGoogleAuthClient();
+
+  const actualSrcSheet = await getActualSheetTitle(authClient, SRC_SHEET);
+  const actualDiffSheet = await getActualSheetTitle(authClient, DIFF_SHEET);
+
+  log('inventoryDiffReport: actual SRC_SHEET =', actualSrcSheet);
+  log('inventoryDiffReport: actual DIFF_SHEET =', actualDiffSheet);
+
+  const items = await loadDataSheet(authClient, actualSrcSheet);
+
   const today = formatDate(nowTZ());
   const title = `ИТОГИ ИНВЕНТАРИЗАЦИИ ${today}`;
 
-  await clearDiffSheetFromRow3(sheets);
-
-  const totalSum = items.reduce(
-    (acc, it) => acc + it.diff * it.price,
-    0
-  );
-  const totalSum20 = totalSum * 0.8;
-  const quarter = totalSum20 / 4;
+  const totalSum = round2(items.reduce((acc, it) => acc + it.sum, 0));
+  const totalSum20 = round2(totalSum * 0.8);
+  const quarter = round2(totalSum20 / 4);
 
   const values = [];
 
@@ -405,11 +923,7 @@ async function buildDiffSheet() {
     '',
   ]);
 
-  const firstDataRow = 3;
-
-  for (let i = 0; i < items.length; i++) {
-    const it = items[i];
-    const rowNum = firstDataRow + i;
+  for (const it of items) {
     values.push([
       it.group,
       it.name,
@@ -417,70 +931,115 @@ async function buildDiffSheet() {
       it.invent,
       it.diff,
       it.price,
-      `=E${rowNum}*F${rowNum}`,
+      it.sum,
       '',
     ]);
   }
 
   values.push(['', '', '', '', '', '', '', '']);
-  const blankRowSheet = firstDataRow + items.length;
-
-  const sumRowSheet = blankRowSheet + 1;
-  let sumFormula = '=0';
-  if (items.length > 0) {
-    sumFormula = `=SUM(G${firstDataRow}:G${blankRowSheet - 1})`;
-  }
-  values.push(['', '', '', '', '', 'Сумма', sumFormula, '']);
-
-  const sum20RowSheet = sumRowSheet + 1;
-  const sum20Formula = `=G${sumRowSheet}*0,8`;
-  const diff20Formula = `=G${sum20RowSheet}/4`;
-  values.push(['', '', '', '', '', 'Сумма - 20%', sum20Formula, diff20Formula]);
+  values.push(['', '', '', '', '', 'Сумма', totalSum, '']);
+  values.push(['', '', '', '', '', 'Сумма - 20%', totalSum20, quarter]);
 
   const totalRows = values.length;
+  const writeRange = `${quoteSheetName(actualDiffSheet)}!A1:H${totalRows}`;
 
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${DIFF_SHEET}!A1:H${totalRows}`,
-    valueInputOption: 'USER_ENTERED',
-    requestBody: { values },
-  });
+  log(`inventoryDiffReport: начинаю REST-запись RAW в лист '${writeRange}'`);
+  log('inventoryDiffReport: rows to write =', totalRows);
+  log('inventoryDiffReport: totalSum =', totalSum);
+  log('inventoryDiffReport: totalSum20 =', totalSum20);
+  log('inventoryDiffReport: quarter =', quarter);
 
-  console.log('inventoryDiffReport: sheet updated, rows =', totalRows);
+  await googleSheetsValuesUpdateRaw(authClient, writeRange, values);
 
-  const tmpDir = '/home/a/abokovsa/berserkclub.ru/MyBerserk/tmp';
-  try {
-    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
-  } catch (e) {
-    console.error('Не удалось создать tmp каталог:', e);
-  }
+  log('inventoryDiffReport: sheet updated, rows =', totalRows);
 
-  const pngPath = `${tmpDir}/inventory_diff_${Date.now()}.png`;
+  const pngPath = `${TMP_DIR}/inventory_diff_${Date.now()}.png`;
 
   await renderDiffPng(
     title,
     items,
-    Math.round(totalSum),
-    Math.round(totalSum20),
-    Math.round(quarter),
+    totalSum,
+    totalSum20,
+    quarter,
     pngPath
   );
 
-  if (CHAT_ID) {
-    await sendPhoto(CHAT_ID, pngPath, title);
-    console.log('inventoryDiffReport: PNG sent to Telegram chat', CHAT_ID);
-  } else {
-    console.log('CHAT_ID не передан, картинку в Telegram не отправляем');
+  if (!CHAT_ID) {
+    log('CHAT_ID не передан, картинку в Telegram не отправляем');
+    log('inventoryDiffReport: INVENT_CLEAR_ON_START remains 0 because CHAT_ID is empty');
+    log('inventoryDiffReport: PNG saved for manual sending:', pngPath);
+    return;
   }
 
-  // После завершения инвентаризации разрешаем новое обновление Data
-  setInventClearOnStart(1);
+  const sent = await sendPhotoRobust(CHAT_ID, pngPath, title);
+
+  if (sent) {
+    log('inventoryDiffReport: PNG sent to Telegram chat', CHAT_ID);
+    setInventClearOnStart(1);
+
+    try {
+      if (fs.existsSync(pngPath)) {
+        fs.unlinkSync(pngPath);
+        log('inventoryDiffReport: tmp PNG removed:', pngPath);
+      }
+    } catch (e) {
+      errlog('inventoryDiffReport: failed to remove tmp PNG:', e);
+    }
+  } else {
+    errlog('inventoryDiffReport: PNG was NOT sent to Telegram chat', CHAT_ID);
+    errlog('inventoryDiffReport: INVENT_CLEAR_ON_START remains 0 to protect inventory results');
+    errlog('inventoryDiffReport: PNG kept for manual sending:', pngPath);
+
+    await sendMessage(
+      CHAT_ID,
+      `❗ Отчёт сформирован, но картинка не отправилась.\nФайл сохранён на сервере:\n${pngPath}\n\nИнвентаризация остаётся заблокированной, чтобы не перезаписать Data.`
+    );
+  }
+
+  log('inventoryDiffReport: done');
 }
 
-// ----- запуск -----
-buildDiffSheet()
-  .then(() => process.exit(0))
-  .catch(err => {
-    console.error('inventoryDiffReport: error', err);
-    process.exit(1);
-  });
+async function main() {
+  let lockAcquired = false;
+
+  try {
+    acquireLock();
+    lockAcquired = true;
+
+    await buildDiffSheet();
+
+    process.exitCode = 0;
+  } catch (e) {
+    if (e?.code === 'ALREADY_RUNNING') {
+      errlog(e.message);
+
+      if (CHAT_ID) {
+        await sendMessage(
+          CHAT_ID,
+          'Отчёт по инвентаризации уже формируется. Повторный запуск пропущен.'
+        );
+      }
+
+      process.exitCode = 0;
+    } else {
+      errlog('inventoryDiffReport: error', e?.stack || e?.message || e);
+
+      if (CHAT_ID) {
+        await sendMessage(
+          CHAT_ID,
+          '❗ Ошибка при формировании отчёта по инвентаризации. Проверь inventoryDiffReport.log'
+        );
+      }
+
+      process.exitCode = 1;
+    }
+  } finally {
+    if (lockAcquired) {
+      releaseLock();
+    }
+
+    process.exit(process.exitCode || 0);
+  }
+}
+
+main();

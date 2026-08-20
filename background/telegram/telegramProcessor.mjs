@@ -1,7 +1,8 @@
 // /home/a/abokovsa/berserkclub.ru/MyBerserk/background/telegram/telegramProcessor.mjs
 
 import dotenv from 'dotenv';
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
+import fs from 'fs';
 
 const PROJECT_ROOT = '/home/a/abokovsa/berserkclub.ru/MyBerserk';
 const ENV_PATH = `${PROJECT_ROOT}/.env`;
@@ -45,6 +46,33 @@ function envNum(name) {
   if (!clean) return null;
   const n = Number.parseInt(clean, 10);
   return Number.isNaN(n) ? null : n;
+}
+
+function envValueFromFile(name, def = '') {
+  try {
+    if (!fs.existsSync(ENV_PATH)) return def;
+
+    const text = fs.readFileSync(ENV_PATH, 'utf8');
+    const lines = text.split(/\r?\n/);
+
+    for (const line of lines) {
+      const trimmed = String(line ?? '').trim();
+
+      if (!trimmed) continue;
+      if (trimmed.startsWith('#')) continue;
+      if (!trimmed.startsWith(`${name}=`)) continue;
+
+      return trimmed
+        .substring(name.length + 1)
+        .split('#')[0]
+        .trim()
+        .replace(/^["']|["']$/g, '');
+    }
+
+    return def;
+  } catch {
+    return def;
+  }
 }
 
 function shortText(value, limit = 150) {
@@ -196,15 +224,42 @@ async function tgAnswerCallback(token, callbackQueryId, text, showAlert = false)
 }
 
 function runMjsAsync(logLine, mjsPath, logPath, args = []) {
-  let cmd = `cd ${shellEscape(PROJECT_ROOT)} && ${shellEscape(NODE_BIN)} ${shellEscape(mjsPath)}`;
-  for (const arg of args) {
-    cmd += ` ${shellEscape(arg)}`;
+  try {
+    const outFd = fs.openSync(logPath, 'a');
+    const errFd = fs.openSync(logPath, 'a');
+
+    const child = spawn(
+      NODE_BIN,
+      [mjsPath, ...args],
+      {
+        cwd: PROJECT_ROOT,
+        detached: true,
+        stdio: ['ignore', outFd, errFd],
+        env: {
+          ...process.env,
+        },
+      }
+    );
+
+    child.unref();
+
+    fs.closeSync(outFd);
+    fs.closeSync(errFd);
+
+    logLine(
+      `[mjs-async] spawned pid=${child.pid}`
+      + ` node=${NODE_BIN}`
+      + ` script=${mjsPath}`
+      + ` args=${args.join(' ')}`
+      + ` log=${logPath}`
+    );
+  } catch (err) {
+    logLine(
+      `[mjs-async] spawn failed`
+      + ` script=${mjsPath}`
+      + ` err=${String(err?.stack || err?.message || err)}`
+    );
   }
-  cmd += ` >> ${shellEscape(logPath)} 2>&1 &`;
-
-  logLine(`[mjs-async] ${cmd}`);
-
-  exec(cmd, { shell: '/bin/bash' }, () => {});
 }
 
 function runMjsWait(logLine, mjsPath, logPath, args = [], extraEnv = {}) {
@@ -903,25 +958,23 @@ async function processMessage(upd, meta, botToken, logLine) {
   if (chatId === CHAT_INVENTORY && mentioned) {
     const isInventoryStart = /^\/?инвентаризация(?:\s|$|[.!?,:;])/u.test(clean);
     const isInventoryEnd = /^\/?конецинвент(?:\s|$|[.!?,:;])/u.test(clean);
+    const currentInventFlag = envValueFromFile('INVENT_CLEAR_ON_START', '0');
 
     logLine(
       `[inventory] check`
       + ` start=${isInventoryStart ? '1' : '0'}`
       + ` end=${isInventoryEnd ? '1' : '0'}`
-      + ` clearFlag=${String(process.env.INVENT_CLEAR_ON_START ?? 'null')}`
+      + ` clearFlag=${currentInventFlag}`
     );
 
     if (isInventoryStart) {
-      let inventFlag = '0';
-      if (process.env.INVENT_CLEAR_ON_START) {
-        inventFlag = String(process.env.INVENT_CLEAR_ON_START).split('#')[0].trim();
-      }
+      const inventFlag = envValueFromFile('INVENT_CLEAR_ON_START', '0');
 
       let msgText = '';
 
       if (inventFlag === '1') {
         msgText = 'Формирую лист Data по данным Эвотор…';
-        logLine(`[inventory] TRIGGER inventoryToSheet chatId=${chatId}`);
+        logLine(`[inventory] TRIGGER inventoryToSheet chatId=${chatId} INVENT_CLEAR_ON_START=${inventFlag}`);
         runMjsAsync(logLine, INVENTORY_TO_SHEET_MJS, INVENTORY_TO_SHEET_LOG, [`--chatId=${chatId}`]);
       } else {
         msgText = 'Идёт инвентаризация. Повторное обновление данных возможно только после окончания инвентаризации.';
