@@ -444,21 +444,57 @@ async function syncLiveGame(game) {
 // ==================================================
 // Статус Valve node
 // ==================================================
+function getNodeSeriesScore(
+  tiMatch,
+  node
+) {
+  const teamA =
+    Number(tiMatch.team_a_id);
 
-async function syncNode(node) {
+  const teamB =
+    Number(tiMatch.team_b_id);
+
+  const nodeTeam1 =
+    Number(node.team_id_1 || 0);
+
+  const nodeTeam2 =
+    Number(node.team_id_2 || 0);
+
+  const wins1 =
+    Number(node.team_1_wins || 0);
+
+  const wins2 =
+    Number(node.team_2_wins || 0);
+
 
   if (
-    await isTiAdminMode()
+    nodeTeam1 === teamA &&
+    nodeTeam2 === teamB
   ) {
-    return;
+    return {
+      scoreA: wins1,
+      scoreB: wins2
+    };
   }
 
 
-  const nodeId =
-    Number(
-      node.node_id || 0
-    );
+  if (
+    nodeTeam1 === teamB &&
+    nodeTeam2 === teamA
+  ) {
+    return {
+      scoreA: wins2,
+      scoreB: wins1
+    };
+  }
 
+
+  return null;
+}
+
+async function syncNode(node) {
+  const nodeId =
+    Number(node.node_id || 0);
 
   if (!nodeId) {
     return;
@@ -471,21 +507,12 @@ async function syncNode(node) {
     );
 
 
-  // Расписание создаёт
-  // tiScheduleSyncWorker.
-  //
-  // Ничего по названиям
-  // команд НЕ угадываем.
-
   if (!tiMatch) {
     return;
   }
 
 
-  // ----------------------------------------------
-  // Ещё не начался
-  // ----------------------------------------------
-
+  // Матч ещё не начинался
   if (
     !node.has_started &&
     !node.is_completed
@@ -494,220 +521,84 @@ async function syncNode(node) {
   }
 
 
-  // ----------------------------------------------
-  // Уже идёт
-  // ----------------------------------------------
+  // Valve LeagueData уже содержит
+  // актуальный счёт серии:
+  //
+  // team_id_1
+  // team_id_2
+  // team_1_wins
+  // team_2_wins
 
-  if (
-    node.has_started &&
-    !node.is_completed
-  ) {
-    if (
-      tiMatch.status !==
-      'finished'
-    ) {
-
-      if (
-        await isTiAdminMode()
-      ) {
-        return;
-      }
-
-
-      await q(
-        `
-          UPDATE ti_matches
-
-          SET
-            status = 'live',
-
-            betting_closed = 1,
-
-            updated_at =
-              CURRENT_TIMESTAMP
-
-          WHERE id = ?
-        `,
-        [
-          tiMatch.id
-        ]
-      );
-    }
-
-
-    return;
-  }
-
-
-  // ----------------------------------------------
-  // Завершён
-  // ----------------------------------------------
-
-  if (
-    !node.is_completed
-  ) {
-    return;
-  }
-
-
-  if (
-    tiMatch.status ===
-    'finished'
-  ) {
-    return;
-  }
-
-
-  // ----------------------------------------------
-  // Получаем ВСЕ match_id серии
-  // ----------------------------------------------
-
-  const matchIds =
-    getNodeMatchIds(
+  const seriesScore =
+    getNodeSeriesScore(
+      tiMatch,
       node
     );
 
 
-  if (
-    !matchIds.length
-  ) {
+  if (!seriesScore) {
     console.error(
-      `[TI VALVE] completed node=${nodeId} has no match IDs`
+      `[TI VALVE] node=${nodeId} ` +
+      `cannot map teams ` +
+      `node=${node.team_id_1}/${node.team_id_2} ` +
+      `db=${tiMatch.team_a_id}/${tiMatch.team_b_id}`
     );
 
     return;
   }
 
-
-  const games = [];
-
-
-  // ----------------------------------------------
-  // Загружаем каждую карту
-  // ----------------------------------------------
-
-  for (
-    const matchId
-    of matchIds
-  ) {
-
-    if (
-      await isTiAdminMode()
-    ) {
-      return;
-    }
-
-
-    try {
-      const game =
-        await getMatchDetails(
-          matchId
-        );
-
-
-      games.push(
-        game
-      );
-
-
-      // Успешно полученную карту
-      // сохраняем сразу.
-      //
-      // Если другая карта временно
-      // не загрузится, эта информация
-      // всё равно останется в БД.
-
-      if (
-        await isTiAdminMode()
-      ) {
-        return;
-      }
-
-
-      await saveGame(
-        tiMatch,
-        game
-      );
-
-    } catch (err) {
-      console.error(
-        `[TI VALVE] match ${matchId} error:`,
-        err.message || err
-      );
-    }
-  }
-
-
-  // ==================================================
-  // ВАЖНАЯ ЗАЩИТА
-  //
-  // Valve node уже может иметь is_completed=true,
-  // но GetMatchDetails одной из карт способен
-  // временно не ответить.
-  //
-  // В таком случае серию НЕ финализируем.
-  //
-  // На следующем цикле worker попробует снова.
-  // ==================================================
-
-  if (
-    games.length !==
-    matchIds.length
-  ) {
-    console.error(
-      `[TI VALVE] node=${nodeId} incomplete match details ` +
-      `${games.length}/${matchIds.length}`
-    );
-
-    return;
-  }
-
-
-  // ----------------------------------------------
-  // Считаем серию
-  // ----------------------------------------------
 
   const {
     scoreA,
     scoreB
-  } =
-    calculateSeriesScore(
-      tiMatch,
-      games
+  } = seriesScore;
+
+
+  // ================================================
+  // Серия ещё идёт
+  // ================================================
+
+  if (!node.is_completed) {
+    await q(
+      `
+        UPDATE ti_matches
+
+        SET
+          status = 'live',
+          betting_closed = 1,
+          score_a = ?,
+          score_b = ?,
+          updated_at = CURRENT_TIMESTAMP
+
+        WHERE id = ?
+          AND status <> 'finished'
+      `,
+      [
+        scoreA,
+        scoreB,
+        tiMatch.id
+      ]
     );
 
 
-  // ----------------------------------------------
-  // Проверяем, что каждая карта
-  // действительно дала победителя
-  // одной из двух команд серии.
-  // ----------------------------------------------
-
-  const accountedGames =
-    scoreA + scoreB;
-
-
-  if (
-    accountedGames !==
-    games.length
-  ) {
-    console.error(
-      `[TI VALVE] node=${nodeId} invalid game winners ` +
-      `counted=${accountedGames}/${games.length}`
+    console.log(
+      `[TI VALVE] NODE LIVE`,
+      `node=${nodeId}`,
+      `${tiMatch.team_a_name} ` +
+      `${scoreA}:${scoreB} ` +
+      `${tiMatch.team_b_name}`
     );
+
 
     return;
   }
 
 
-  // ----------------------------------------------
-  // Завершённая серия не может
-  // иметь равный счёт.
-  // ----------------------------------------------
+  // ================================================
+  // Серия завершена
+  // ================================================
 
-  if (
-    scoreA === scoreB
-  ) {
+  if (scoreA === scoreB) {
     console.error(
       `[TI VALVE] completed node=${nodeId} ` +
       `invalid score ${scoreA}:${scoreB}`
@@ -717,79 +608,20 @@ async function syncNode(node) {
   }
 
 
-  // ----------------------------------------------
-  // Проверяем формат playoff.
-  //
-  // node 21 = Grand Final = BO5 = 3 победы.
-  //
-  // Остальные playoff nodes = BO3 = 2 победы.
-  //
-  // Для node вне playoff формат не угадываем.
-  // ----------------------------------------------
-
-  const requiredWins =
-    getRequiredWins(
-      nodeId
-    );
-
-
-  if (
-    requiredWins !== null
-  ) {
-    const winnerScore =
-      Math.max(
-        scoreA,
-        scoreB
-      );
-
-
-    if (
-      winnerScore <
-      requiredWins
-    ) {
-      console.error(
-        `[TI VALVE] node=${nodeId} ` +
-        `invalid completed series ` +
-        `${scoreA}:${scoreB}; ` +
-        `required wins=${requiredWins}`
-      );
-
-      return;
-    }
-  }
-
-
-  // ----------------------------------------------
-  // Победитель серии
-  // ----------------------------------------------
-
   const winnerTeamId =
     scoreA > scoreB
-      ? Number(
-          tiMatch.team_a_id
-        )
-      : Number(
-          tiMatch.team_b_id
-        );
+      ? Number(tiMatch.team_a_id)
+      : Number(tiMatch.team_b_id);
 
 
-  if (
-    !winnerTeamId
-  ) {
-    console.error(
-      `[TI VALVE] node=${nodeId} winner team id is empty`
-    );
-
-    return;
-  }
-
-
-  // ----------------------------------------------
-  // FINISHED
-  // ----------------------------------------------
+  // Матч уже корректно завершён.
+  // Не обновляем повторно каждый цикл.
 
   if (
-    await isTiAdminMode()
+    tiMatch.status === 'finished' &&
+    Number(tiMatch.score_a) === scoreA &&
+    Number(tiMatch.score_b) === scoreB &&
+    Number(tiMatch.winner_team_id) === winnerTeamId
   ) {
     return;
   }
@@ -802,37 +634,31 @@ async function syncNode(node) {
       SET
         score_a = ?,
         score_b = ?,
-
         winner_team_id = ?,
-
         status = 'finished',
-
         betting_closed = 1,
-
-        updated_at =
-          CURRENT_TIMESTAMP
+        updated_at = CURRENT_TIMESTAMP
 
       WHERE id = ?
     `,
     [
       scoreA,
       scoreB,
-
       winnerTeamId,
-
       tiMatch.id
     ]
   );
 
 
   console.log(
-    `[TI VALVE] FINISHED`,
+    `[TI VALVE] NODE FINISHED`,
     `node=${nodeId}`,
-    `${tiMatch.team_a_name} ${scoreA}:${scoreB} ${tiMatch.team_b_name}`,
+    `${tiMatch.team_a_name} ` +
+    `${scoreA}:${scoreB} ` +
+    `${tiMatch.team_b_name}`,
     `winner=${winnerTeamId}`
   );
 }
-
 
 // ==================================================
 // Один цикл

@@ -32,6 +32,13 @@ import {
 
 
 import {
+  handleTiFeedbackCallback,
+  handleTiFeedbackAdminCallback,
+  isTiFeedbackBroadcastEnabled
+} from '../tiFeedback.js';
+
+
+import {
   registerTiUser,
   getTiUserByTelegramId,
   getOpenTiMatches,
@@ -3709,6 +3716,10 @@ async function showTiAdminMenu(
     await isTiAdminMode();
 
 
+  const feedbackBroadcastEnabled =
+    isTiFeedbackBroadcastEnabled();
+
+
   await tiSend(
     chatId,
 
@@ -3718,6 +3729,12 @@ Admin Mode: ${
       enabled
         ? '🟢 ON'
         : '⚪ OFF'
+    }
+
+Рассылка опроса: ${
+      feedbackBroadcastEnabled
+        ? '🟢 ON'
+        : '🔒 OFF'
     }`,
 
     {
@@ -3761,6 +3778,28 @@ Admin Mode: ${
 
               callback_data:
                 'tiadm:bracket'
+            }
+          ],
+
+          [
+            {
+              text:
+                '📊 Результаты опроса',
+
+              callback_data:
+                'tiadm:feedback:stats'
+            }
+          ],
+
+          [
+            {
+              text:
+                feedbackBroadcastEnabled
+                  ? '📣 Отправить опрос'
+                  : '🔒 Рассылка опроса OFF',
+
+              callback_data:
+                'tiadm:feedback:ask'
             }
           ],
 
@@ -4597,6 +4636,25 @@ async function handleTiAdminCallback(
 
 
   // ------------------------------------------------
+  // FEEDBACK
+  // ------------------------------------------------
+
+  if (
+    data?.startsWith(
+      'tiadm:feedback:'
+    )
+  ) {
+    await handleTiFeedbackAdminCallback(
+      query,
+      data
+    );
+
+
+    return;
+  }
+
+
+  // ------------------------------------------------
   // RATING EXCLUSION GROUPS
   // ------------------------------------------------
 
@@ -5353,6 +5411,25 @@ async function handleCallback(
     )
   ) {
     await handleTiAdminCallback(
+      query,
+      data
+    );
+
+
+    return;
+  }
+
+
+  // ------------------------------------------------
+  // FEEDBACK CALLBACKS
+  // ------------------------------------------------
+
+  if (
+    data?.startsWith(
+      'ti:fb:'
+    )
+  ) {
+    await handleTiFeedbackCallback(
       query,
       data
     );

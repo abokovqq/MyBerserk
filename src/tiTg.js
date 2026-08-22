@@ -4,13 +4,46 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 
-const TOKEN = process.env.TI_BOT_TOKEN;
+const TOKEN =
+  process.env.TI_BOT_TOKEN;
+
 
 if (!TOKEN) {
-  throw new Error('TI_BOT_TOKEN is not set');
+  throw new Error(
+    'TI_BOT_TOKEN is not set'
+  );
 }
 
-const API = `https://api.telegram.org/bot${TOKEN}`;
+
+const API =
+  `https://api.telegram.org/bot${TOKEN}`;
+
+
+// ==================================================
+// SAFE RETRY
+//
+// Повторяем только getUpdates.
+//
+// Отправку сообщений / фото / callback
+// автоматически не повторяем, чтобы не получить
+// дубли при неопределённом результате POST.
+// ==================================================
+
+const SAFE_RETRY_METHODS =
+  new Set([
+    'getUpdates'
+  ]);
+
+
+function sleep(ms) {
+  return new Promise(
+    resolve =>
+      setTimeout(
+        resolve,
+        ms
+      )
+  );
+}
 
 
 // ==================================================
@@ -44,6 +77,7 @@ export async function tiTg(
         key,
         JSON.stringify(value)
       );
+
     } else {
       params.append(
         key,
@@ -53,39 +87,105 @@ export async function tiTg(
   }
 
 
-  const response =
-    await fetch(
-      `${API}/${method}`,
-      {
-        method: 'POST',
-
-        headers: {
-          'Content-Type':
-            'application/x-www-form-urlencoded'
-        },
-
-        body:
-          params.toString()
-      }
+  const canRetry =
+    SAFE_RETRY_METHODS.has(
+      method
     );
 
 
-  const data =
-    await response.json();
+  const maxAttempts =
+    canRetry
+      ? 3
+      : 1;
 
 
-  if (
-    !response.ok ||
-    !data.ok
+  let lastError = null;
+
+
+  for (
+    let attempt = 1;
+    attempt <= maxAttempts;
+    attempt++
   ) {
-    throw new Error(
-      `TI TG ${method} ${response.status}: ` +
-      JSON.stringify(data)
-    );
+    try {
+
+      const response =
+        await fetch(
+          `${API}/${method}`,
+          {
+            method: 'POST',
+
+            headers: {
+              'Content-Type':
+                'application/x-www-form-urlencoded'
+            },
+
+            body:
+              params.toString()
+          }
+        );
+
+
+      const data =
+        await response.json();
+
+
+      if (
+        !response.ok ||
+        !data.ok
+      ) {
+        throw new Error(
+          `TI TG ${method} ${response.status}: ` +
+          `${JSON.stringify(data)}`
+        );
+      }
+
+
+      return data.result;
+
+    } catch (err) {
+
+      lastError = err;
+
+
+      const telegramApiError =
+        String(
+          err?.message || ''
+        ).startsWith(
+          'TI TG '
+        );
+
+
+      if (
+        !canRetry ||
+        telegramApiError ||
+        attempt >= maxAttempts
+      ) {
+        throw err;
+      }
+
+
+      console.warn(
+        new Date().toISOString(),
+
+        `[TI TG] ${method} network retry ` +
+        `${attempt}/${maxAttempts}:`,
+
+        err?.cause?.code ||
+          err?.code ||
+          err?.message ||
+          err
+      );
+
+
+      await sleep(
+        attempt * 1000
+      );
+    }
   }
 
 
-  return data.result;
+  throw lastError;
 }
 
 
@@ -102,6 +202,7 @@ export async function tiSend(
     'sendMessage',
     {
       chat_id,
+
       text,
 
       parse_mode:
@@ -183,8 +284,7 @@ export async function tiSendPhoto(
     new Blob(
       [file],
       {
-        type:
-          'image/png'
+        type: 'image/png'
       }
     ),
 
@@ -214,7 +314,7 @@ export async function tiSendPhoto(
   ) {
     throw new Error(
       `TI TG sendPhoto ${response.status}: ` +
-      JSON.stringify(data)
+      `${JSON.stringify(data)}`
     );
   }
 

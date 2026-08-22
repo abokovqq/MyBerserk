@@ -15,6 +15,33 @@ export const TI_FEEDBACK_SURVEY_CODE =
 
 
 // ============================================================
+// ENV — РАЗРЕШЕНИЕ МАССОВОЙ РАССЫЛКИ
+//
+// По умолчанию массовая рассылка ЗАПРЕЩЕНА.
+// Для включения в .env:
+// TI_FEEDBACK_BROADCAST_ENABLED=1
+// ============================================================
+
+export function isTiFeedbackBroadcastEnabled() {
+  const value =
+    String(
+      process.env.TI_FEEDBACK_BROADCAST_ENABLED || ''
+    )
+      .trim()
+      .toLowerCase();
+
+  return [
+    '1',
+    'true',
+    'yes',
+    'on'
+  ].includes(
+    value
+  );
+}
+
+
+// ============================================================
 // ВАРИАНТЫ ОТВЕТОВ
 // ============================================================
 
@@ -793,6 +820,16 @@ export async function sendTiFeedbackInviteToUserId(
     };
   }
 
+  if (
+    feedback?.invite_sent_at
+  ) {
+    return {
+      sent: false,
+      reason: 'already_sent',
+      user
+    };
+  }
+
   await showTiFeedbackIntro(
     user.telegram_id
   );
@@ -1203,15 +1240,7 @@ async function showNextTiFeedbackQuestion(
 
 
 // ============================================================
-// CALLBACK HANDLER
-//
-// В tiBotWorker потом будет только:
-//
-// if (data?.startsWith('ti:fb:')) {
-//   await handleTiFeedbackCallback(query, data);
-//   return;
-// }
-//
+// CALLBACK HANDLER — USER
 // ============================================================
 
 export async function handleTiFeedbackCallback(
@@ -1232,10 +1261,6 @@ export async function handleTiFeedbackCallback(
   }
 
 
-  // ----------------------------------------------------------
-  // Проверяем регистрацию КАЖДЫЙ РАЗ
-  // ----------------------------------------------------------
-
   const user =
     await getTiFeedbackUserByTelegramId(
       telegramId
@@ -1252,10 +1277,6 @@ export async function handleTiFeedbackCallback(
     return;
   }
 
-
-  // ----------------------------------------------------------
-  // START
-  // ----------------------------------------------------------
 
   if (
     data ===
@@ -1285,10 +1306,6 @@ export async function handleTiFeedbackCallback(
   }
 
 
-  // ----------------------------------------------------------
-  // Q1
-  // ----------------------------------------------------------
-
   if (
     data?.startsWith(
       'ti:fb:q1:'
@@ -1315,10 +1332,6 @@ export async function handleTiFeedbackCallback(
     return;
   }
 
-
-  // ----------------------------------------------------------
-  // Q2
-  // ----------------------------------------------------------
 
   if (
     data?.startsWith(
@@ -1347,10 +1360,6 @@ export async function handleTiFeedbackCallback(
   }
 
 
-  // ----------------------------------------------------------
-  // Q3
-  // ----------------------------------------------------------
-
   if (
     data?.startsWith(
       'ti:fb:q3:'
@@ -1378,10 +1387,6 @@ export async function handleTiFeedbackCallback(
   }
 
 
-  // ----------------------------------------------------------
-  // Q4
-  // ----------------------------------------------------------
-
   if (
     data?.startsWith(
       'ti:fb:q4:'
@@ -1408,10 +1413,6 @@ export async function handleTiFeedbackCallback(
     return;
   }
 
-
-  // ----------------------------------------------------------
-  // Q5
-  // ----------------------------------------------------------
 
   if (
     data?.startsWith(
@@ -1446,6 +1447,969 @@ export async function handleTiFeedbackCallback(
   console.log(
     new Date().toISOString(),
     '[TI FEEDBACK] unknown callback:',
+    data
+  );
+}
+
+
+// ============================================================
+// ADMIN — HELPERS
+// ============================================================
+
+function tiFeedbackEscapeHtml(
+  value
+) {
+  return String(
+    value ?? ''
+  )
+    .replaceAll(
+      '&',
+      '&amp;'
+    )
+    .replaceAll(
+      '<',
+      '&lt;'
+    )
+    .replaceAll(
+      '>',
+      '&gt;'
+    );
+}
+
+
+function tiFeedbackAdminName(
+  user
+) {
+  const username =
+    String(
+      user?.username || ''
+    ).trim();
+
+  if (username) {
+    return `@${username}`;
+  }
+
+  return (
+    `Telegram ID ${user?.telegram_id || '—'}`
+  );
+}
+
+
+function tiFeedbackPercent(
+  count,
+  total
+) {
+  if (!total) {
+    return 0;
+  }
+
+  return Math.round(
+    Number(count) *
+    100 /
+    Number(total)
+  );
+}
+
+
+// ============================================================
+// ADMIN — ВСЕ УЧАСТНИКИ + ОТВЕТЫ
+// ============================================================
+
+export async function getTiFeedbackAdminRows() {
+  const [rows] =
+    await pool.query(
+      `
+        SELECT
+          u.id AS user_id,
+          u.telegram_id,
+          u.username,
+          u.rating_group,
+
+          f.invite_sent_at,
+          f.started_at,
+
+          f.overall,
+          f.liked,
+          f.missed_reason,
+          f.inconvenient,
+          f.next_event,
+
+          f.completed_at
+
+        FROM ti_users u
+
+        LEFT JOIN ti_feedback f
+          ON f.user_id = u.id
+          AND f.survey_code = ?
+
+        WHERE
+          u.is_active = 1
+          AND u.phone_verified = 1
+          AND u.registration_status = 'approved'
+          AND u.telegram_id IS NOT NULL
+
+        ORDER BY
+          u.id ASC
+      `,
+      [
+        TI_FEEDBACK_SURVEY_CODE
+      ]
+    );
+
+  return rows;
+}
+
+
+// ============================================================
+// ADMIN — СТАТИСТИКА ОДНОГО ВОПРОСА
+// ============================================================
+
+function buildTiFeedbackStatsBlock(
+  rows,
+  field,
+  title
+) {
+  const options =
+    TI_FEEDBACK_OPTIONS[field];
+
+  const answered =
+    rows.filter(
+      row =>
+        Boolean(
+          row[field]
+        )
+    ).length;
+
+  let text =
+    `${title}\n`;
+
+  for (
+    const [
+      value,
+      label
+    ]
+    of Object.entries(
+      options
+    )
+  ) {
+    const count =
+      rows.filter(
+        row =>
+          row[field] ===
+          value
+      ).length;
+
+    const percent =
+      tiFeedbackPercent(
+        count,
+        answered
+      );
+
+    text +=
+      `${label} — ` +
+      `<b>${count}</b> (${percent}%)\n`;
+  }
+
+  return {
+    text:
+      text.trimEnd(),
+
+    answered
+  };
+}
+
+
+// ============================================================
+// ADMIN — ГЛАВНЫЕ РЕЗУЛЬТАТЫ
+// ============================================================
+
+async function showTiFeedbackAdminStats(
+  query
+) {
+  const rows =
+    await getTiFeedbackAdminRows();
+
+  const total =
+    rows.length;
+
+  const sent =
+    rows.filter(
+      row =>
+        row.invite_sent_at
+    ).length;
+
+  const started =
+    rows.filter(
+      row =>
+        row.started_at
+    ).length;
+
+  const completed =
+    rows.filter(
+      row =>
+        row.completed_at
+    ).length;
+
+  const overall =
+    buildTiFeedbackStatsBlock(
+      rows,
+      'overall',
+      '🎮 <b>КАК ТЕБЕ КОНКУРС В ЦЕЛОМ?</b>'
+    );
+
+  const liked =
+    buildTiFeedbackStatsBlock(
+      rows,
+      'liked',
+      '❤️ <b>ЧТО ПОНРАВИЛОСЬ БОЛЬШЕ ВСЕГО?</b>'
+    );
+
+  const missed =
+    buildTiFeedbackStatsBlock(
+      rows,
+      'missed_reason',
+      '🎯 <b>ПОЧЕМУ ПРОПУСКАЛИ ПРОГНОЗЫ?</b>'
+    );
+
+  const inconvenient =
+    buildTiFeedbackStatsBlock(
+      rows,
+      'inconvenient',
+      '⚙️ <b>ЧТО БЫЛО САМЫМ НЕУДОБНЫМ?</b>'
+    );
+
+  const nextEvent =
+    buildTiFeedbackStatsBlock(
+      rows,
+      'next_event',
+      '🏆 <b>БУДУТ УЧАСТВОВАТЬ ЕЩЁ?</b>'
+    );
+
+  const text =
+    `📊 <b>РЕЗУЛЬТАТЫ ОПРОСА TI 2026</b>\n\n` +
+    `👥 Участников: <b>${total}</b>\n` +
+    `📨 Опрос отправлен: <b>${sent}</b>\n` +
+    `▶️ Начали: <b>${started}</b>\n` +
+    `✅ Завершили: <b>${completed}</b>\n\n` +
+    `━━━━━━━━━━━━━━━━━━\n\n` +
+    `${overall.text}\n\n` +
+    `━━━━━━━━━━━━━━━━━━\n\n` +
+    `${liked.text}\n\n` +
+    `━━━━━━━━━━━━━━━━━━\n\n` +
+    `${missed.text}\n` +
+    `Ответили на вопрос: <b>${missed.answered}</b>\n\n` +
+    `━━━━━━━━━━━━━━━━━━\n\n` +
+    `${inconvenient.text}\n\n` +
+    `━━━━━━━━━━━━━━━━━━\n\n` +
+    `${nextEvent.text}`;
+
+  await editTiFeedbackMessage(
+    query,
+    text,
+    [
+      [
+        {
+          text:
+            '👥 Ответы участников',
+
+          callback_data:
+            'tiadm:feedback:users:1'
+        }
+      ],
+
+      [
+        {
+          text:
+            '⏳ Не прошли опрос',
+
+          callback_data:
+            'tiadm:feedback:pending'
+        }
+      ],
+
+      [
+        {
+          text:
+            '🔄 Обновить',
+
+          callback_data:
+            'tiadm:feedback:stats'
+        }
+      ],
+
+      [
+        {
+          text:
+            '← Админ-меню',
+
+          callback_data:
+            'tiadm:menu'
+        }
+      ]
+    ]
+  );
+}
+
+
+// ============================================================
+// ADMIN — ОТВЕТЫ УЧАСТНИКОВ
+// ============================================================
+
+async function showTiFeedbackAdminUsers(
+  query,
+  requestedPage = 1
+) {
+  const allRows =
+    await getTiFeedbackAdminRows();
+
+  const rows =
+    allRows.filter(
+      row =>
+        row.started_at
+    );
+
+  const pageSize =
+    6;
+
+  const totalPages =
+    Math.max(
+      1,
+      Math.ceil(
+        rows.length /
+        pageSize
+      )
+    );
+
+  const page =
+    Math.min(
+      totalPages,
+      Math.max(
+        1,
+        Number(
+          requestedPage
+        ) || 1
+      )
+    );
+
+  const start =
+    (
+      page - 1
+    ) *
+    pageSize;
+
+  const pageRows =
+    rows.slice(
+      start,
+      start + pageSize
+    );
+
+  let text =
+    `👥 <b>ОТВЕТЫ УЧАСТНИКОВ</b>\n\n` +
+    `Страница <b>${page}/${totalPages}</b>\n` +
+    `Начали опрос: <b>${rows.length}</b>\n\n`;
+
+  if (
+    !pageRows.length
+  ) {
+    text +=
+      'Пока никто не начал опрос.';
+
+  } else {
+    for (
+      const row
+      of pageRows
+    ) {
+      const name =
+        tiFeedbackEscapeHtml(
+          tiFeedbackAdminName(
+            row
+          )
+        );
+
+      const status =
+        row.completed_at
+          ? '✅'
+          : '⏳';
+
+      text +=
+        `${status} <b>${name}</b>\n`;
+
+      if (
+        row.overall
+      ) {
+        text +=
+          `🎮 ${
+            TI_FEEDBACK_OPTIONS
+              .overall[
+                row.overall
+              ]
+          }\n`;
+      }
+
+      if (
+        row.liked
+      ) {
+        text +=
+          `❤️ ${
+            TI_FEEDBACK_OPTIONS
+              .liked[
+                row.liked
+              ]
+          }\n`;
+      }
+
+      if (
+        row.missed_reason
+      ) {
+        text +=
+          `🎯 ${
+            TI_FEEDBACK_OPTIONS
+              .missed_reason[
+                row.missed_reason
+              ]
+          }\n`;
+      }
+
+      if (
+        row.inconvenient
+      ) {
+        text +=
+          `⚙️ ${
+            TI_FEEDBACK_OPTIONS
+              .inconvenient[
+                row.inconvenient
+              ]
+          }\n`;
+      }
+
+      if (
+        row.next_event
+      ) {
+        text +=
+          `🏆 ${
+            TI_FEEDBACK_OPTIONS
+              .next_event[
+                row.next_event
+              ]
+          }\n`;
+      }
+
+      text += '\n';
+    }
+  }
+
+  const keyboard = [];
+  const navigation = [];
+
+  if (
+    page > 1
+  ) {
+    navigation.push({
+      text:
+        '← Назад',
+
+      callback_data:
+        `tiadm:feedback:users:${page - 1}`
+    });
+  }
+
+  if (
+    page < totalPages
+  ) {
+    navigation.push({
+      text:
+        'Далее →',
+
+      callback_data:
+        `tiadm:feedback:users:${page + 1}`
+    });
+  }
+
+  if (
+    navigation.length
+  ) {
+    keyboard.push(
+      navigation
+    );
+  }
+
+  keyboard.push([
+    {
+      text:
+        '📊 Общие результаты',
+
+      callback_data:
+        'tiadm:feedback:stats'
+    }
+  ]);
+
+  keyboard.push([
+    {
+      text:
+        '← Админ-меню',
+
+      callback_data:
+        'tiadm:menu'
+    }
+  ]);
+
+  await editTiFeedbackMessage(
+    query,
+    text.trim(),
+    keyboard
+  );
+}
+
+
+// ============================================================
+// ADMIN — НЕ ПРОШЛИ ОПРОС
+// ============================================================
+
+async function showTiFeedbackAdminPending(
+  query
+) {
+  const rows =
+    await getTiFeedbackAdminRows();
+
+  const notSent =
+    rows.filter(
+      row =>
+        !row.invite_sent_at
+    );
+
+  const notStarted =
+    rows.filter(
+      row =>
+        row.invite_sent_at &&
+        !row.started_at
+    );
+
+  const notCompleted =
+    rows.filter(
+      row =>
+        row.started_at &&
+        !row.completed_at
+    );
+
+  function names(
+    list
+  ) {
+    if (
+      !list.length
+    ) {
+      return '—';
+    }
+
+    return list
+      .map(
+        row =>
+          tiFeedbackEscapeHtml(
+            tiFeedbackAdminName(
+              row
+            )
+          )
+      )
+      .join('\n');
+  }
+
+  const text =
+    `⏳ <b>СТАТУС ОПРОСА</b>\n\n` +
+    `📭 <b>Ещё не отправлен — ${notSent.length}</b>\n` +
+    `${names(notSent)}\n\n` +
+    `━━━━━━━━━━━━━━━━━━\n\n` +
+    `📨 <b>Получили, но не начали — ${notStarted.length}</b>\n` +
+    `${names(notStarted)}\n\n` +
+    `━━━━━━━━━━━━━━━━━━\n\n` +
+    `▶️ <b>Начали, но не завершили — ${notCompleted.length}</b>\n` +
+    `${names(notCompleted)}`;
+
+  await editTiFeedbackMessage(
+    query,
+    text,
+    [
+      [
+        {
+          text:
+            '📊 Результаты',
+
+          callback_data:
+            'tiadm:feedback:stats'
+        }
+      ],
+
+      [
+        {
+          text:
+            '← Админ-меню',
+
+          callback_data:
+            'tiadm:menu'
+        }
+      ]
+    ]
+  );
+}
+
+
+// ============================================================
+// ADMIN — ПОДТВЕРЖДЕНИЕ РАССЫЛКИ
+// ============================================================
+
+async function showTiFeedbackAdminSendAsk(
+  query
+) {
+  if (
+    !isTiFeedbackBroadcastEnabled()
+  ) {
+    await editTiFeedbackMessage(
+      query,
+
+      `🔒 <b>РАССЫЛКА ОПРОСА ОТКЛЮЧЕНА</b>
+
+` +
+      `Массовая отправка заблокирована через ENV.
+
+` +
+      `Для включения установи:
+` +
+      `<code>TI_FEEDBACK_BROADCAST_ENABLED=1</code>
+
+` +
+      `После изменения .env перезапусти TI worker.`,
+
+      [
+        [
+          {
+            text:
+              '← Админ-меню',
+
+            callback_data:
+              'tiadm:menu'
+          }
+        ]
+      ]
+    );
+
+    return;
+  }
+
+  const rows =
+    await getTiFeedbackAdminRows();
+
+  const total =
+    rows.length;
+
+  const sent =
+    rows.filter(
+      row =>
+        row.invite_sent_at
+    ).length;
+
+  const completed =
+    rows.filter(
+      row =>
+        row.completed_at
+    ).length;
+
+  const toSend =
+    rows.filter(
+      row =>
+        !row.invite_sent_at &&
+        !row.completed_at
+    ).length;
+
+  const keyboard = [];
+
+  if (
+    toSend > 0
+  ) {
+    keyboard.push([
+      {
+        text:
+          `✅ Да, отправить (${toSend})`,
+
+        callback_data:
+          'tiadm:feedback:send'
+      }
+    ]);
+  }
+
+  keyboard.push([
+    {
+      text:
+        '❌ Отмена',
+
+      callback_data:
+        'tiadm:menu'
+    }
+  ]);
+
+  await editTiFeedbackMessage(
+    query,
+
+    `📣 <b>РАССЫЛКА ОПРОСА</b>\n\n` +
+    `👥 Получатели: <b>${total}</b>\n` +
+    `📨 Уже получили: <b>${sent}</b>\n` +
+    `✅ Опрос прошли: <b>${completed}</b>\n\n` +
+    `📤 Будет отправлено сейчас:\n` +
+    `<b>${toSend}</b>\n\n` +
+    `${
+      toSend
+        ? 'Отправить приглашение пройти опрос?'
+        : '✅ Всем доступным участникам опрос уже отправлен.'
+    }`,
+
+    keyboard
+  );
+}
+
+
+// ============================================================
+// ADMIN — МАССОВАЯ РАССЫЛКА
+// ============================================================
+
+export async function sendTiFeedbackInvites() {
+  if (
+    !isTiFeedbackBroadcastEnabled()
+  ) {
+    throw new Error(
+      'TI feedback broadcast is disabled by TI_FEEDBACK_BROADCAST_ENABLED'
+    );
+  }
+
+  const recipients =
+    await getTiFeedbackRecipients();
+
+  let sent =
+    0;
+
+  let skipped =
+    0;
+
+  const failed =
+    [];
+
+  for (
+    const user
+    of recipients
+  ) {
+    if (
+      user.invite_sent_at ||
+      user.completed_at
+    ) {
+      skipped += 1;
+      continue;
+    }
+
+    try {
+      const result =
+        await sendTiFeedbackInviteToUserId(
+          user.id
+        );
+
+      if (
+        result.sent
+      ) {
+        sent += 1;
+
+      } else {
+        skipped += 1;
+      }
+
+    } catch (err) {
+      failed.push({
+        user_id:
+          user.id,
+
+        telegram_id:
+          user.telegram_id,
+
+        username:
+          user.username,
+
+        error:
+          String(
+            err?.message ||
+            err
+          )
+      });
+    }
+
+    await new Promise(
+      resolve =>
+        setTimeout(
+          resolve,
+          120
+        )
+    );
+  }
+
+  return {
+    total:
+      recipients.length,
+
+    sent,
+
+    skipped,
+
+    failed
+  };
+}
+
+
+// ============================================================
+// ADMIN — CALLBACK HANDLER
+// Вызывается из handleTiAdminCallback ПОСЛЕ проверки админа.
+// ============================================================
+
+export async function handleTiFeedbackAdminCallback(
+  query,
+  data
+) {
+  const chatId =
+    query.message?.chat?.id;
+
+  if (!chatId) {
+    return;
+  }
+
+  if (
+    data ===
+      'tiadm:feedback:stats'
+  ) {
+    await showTiFeedbackAdminStats(
+      query
+    );
+
+    return;
+  }
+
+  if (
+    data?.startsWith(
+      'tiadm:feedback:users:'
+    )
+  ) {
+    const page =
+      Number(
+        data.split(':')[3]
+      ) || 1;
+
+    await showTiFeedbackAdminUsers(
+      query,
+      page
+    );
+
+    return;
+  }
+
+  if (
+    data ===
+      'tiadm:feedback:pending'
+  ) {
+    await showTiFeedbackAdminPending(
+      query
+    );
+
+    return;
+  }
+
+  if (
+    data ===
+      'tiadm:feedback:ask'
+  ) {
+    await showTiFeedbackAdminSendAsk(
+      query
+    );
+
+    return;
+  }
+
+  if (
+    data ===
+      'tiadm:feedback:send'
+  ) {
+    if (
+      !isTiFeedbackBroadcastEnabled()
+    ) {
+      await showTiFeedbackAdminSendAsk(
+        query
+      );
+
+      return;
+    }
+
+    await editTiFeedbackMessage(
+      query,
+
+      `📣 <b>РАССЫЛКА ОПРОСА</b>\n\n` +
+      `⏳ Отправляю приглашения участникам...`,
+
+      []
+    );
+
+    const result =
+      await sendTiFeedbackInvites();
+
+    let failedText =
+      '';
+
+    if (
+      result.failed.length
+    ) {
+      failedText =
+        '\n\n❌ <b>Не удалось отправить:</b>\n' +
+
+        result.failed
+          .map(
+            item =>
+              tiFeedbackEscapeHtml(
+                item.username
+                  ? `@${item.username}`
+                  : `Telegram ID ${item.telegram_id}`
+              )
+          )
+          .join('\n');
+    }
+
+    await editTiFeedbackMessage(
+      query,
+
+      `✅ <b>РАССЫЛКА ЗАВЕРШЕНА</b>\n\n` +
+      `👥 Всего участников: <b>${result.total}</b>\n` +
+      `📤 Отправлено сейчас: <b>${result.sent}</b>\n` +
+      `⏭ Уже получали / завершили: <b>${result.skipped}</b>\n` +
+      `❌ Ошибок: <b>${result.failed.length}</b>` +
+      `${failedText}`,
+
+      [
+        [
+          {
+            text:
+              '📊 Результаты опроса',
+
+            callback_data:
+              'tiadm:feedback:stats'
+          }
+        ],
+
+        [
+          {
+            text:
+              '← Админ-меню',
+
+            callback_data:
+              'tiadm:menu'
+          }
+        ]
+      ]
+    );
+
+    return;
+  }
+
+  console.log(
+    new Date().toISOString(),
+    '[TI FEEDBACK ADMIN] unknown callback:',
     data
   );
 }
