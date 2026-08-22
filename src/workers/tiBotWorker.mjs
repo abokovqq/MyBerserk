@@ -5338,7 +5338,7 @@ async function handleCallback(
   }
 
 
-  await acknowledgeCallback(
+  void acknowledgeCallback(
     query
   );
 

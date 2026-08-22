@@ -102,7 +102,59 @@ export async function getTiLeagueData() {
     `&delay_seconds=0`;
 
 
-  return curlJson(url);
+  const maxAttempts = 3;
+
+  let lastError = null;
+
+
+  for (
+    let attempt = 1;
+    attempt <= maxAttempts;
+    attempt++
+  ) {
+
+    try {
+
+      return await curlJson(
+        url
+      );
+
+    } catch (err) {
+
+      lastError = err;
+
+
+      if (
+        attempt >= maxAttempts
+      ) {
+        break;
+      }
+
+
+      console.warn(
+        new Date().toISOString(),
+        `[TI VALVE API] GetLeagueData attempt ` +
+        `${attempt}/${maxAttempts} failed:`,
+        err?.message || err
+      );
+
+
+      // Между попытками:
+      // 1-я ошибка -> 1 сек
+      // 2-я ошибка -> 2 сек
+
+      await new Promise(
+        resolve =>
+          setTimeout(
+            resolve,
+            attempt * 1000
+          )
+      );
+    }
+  }
+
+
+  throw lastError;
 }
 
 

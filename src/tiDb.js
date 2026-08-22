@@ -451,11 +451,13 @@ export async function getTiRating() {
         u.gizmo_user_id,
         u.gizmo_username,
         u.gizmo_first_name,
-        u.gizmo_last_name
+        u.gizmo_last_name,
+        u.created_at
 
       ORDER BY
         score DESC,
         correct_predictions DESC,
+        u.created_at ASC,
         u.id ASC
     `
   );
@@ -847,21 +849,23 @@ export async function getTiOutOfCompetitionRating() {
         AND u.rating_group =
           'out_of_competition'
 
-      GROUP BY
-        u.id,
-        u.telegram_id,
-        u.registration_status,
-        u.rating_name_mode,
-        u.gizmo_match_status,
-        u.gizmo_user_id,
-        u.gizmo_username,
-        u.gizmo_first_name,
-        u.gizmo_last_name
+        GROUP BY
+          u.id,
+          u.telegram_id,
+          u.registration_status,
+          u.rating_name_mode,
+          u.gizmo_match_status,
+          u.gizmo_user_id,
+          u.gizmo_username,
+          u.gizmo_first_name,
+          u.gizmo_last_name,
+          u.created_at
 
-      ORDER BY
-        score DESC,
-        correct_predictions DESC,
-        u.id ASC
+        ORDER BY
+          score DESC,
+          correct_predictions DESC,
+          u.created_at ASC,
+          u.id ASC
     `
   );
 }
